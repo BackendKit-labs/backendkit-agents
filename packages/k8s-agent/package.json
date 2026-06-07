@@ -1,0 +1,40 @@
+{
+  "name": "@backendkit-labs/k8s-agent",
+  "version": "0.1.0",
+  "description": "Kubernetes agent — apply manifests, inspect resources, logs, exec. Runs as MCP stdio plugin or standalone HTTP MCP server.",
+  "main": "dist/mcp.js",
+  "bin": {
+    "k8s-agent": "./dist/mcp.js"
+  },
+  "files": [
+    "dist/"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BackendKit-labs/backendkit-agents.git",
+    "directory": "packages/k8s-agent"
+  },
+  "publishConfig": { "access": "public" },
+  "license": "MIT",
+  "engines": { "node": ">=20.0.0" },
+  "scripts": {
+    "build": "tsc",
+    "dev": "ts-node src/index.ts",
+    "start": "node dist/mcp.js",
+    "start:http": "node dist/mcp.js http",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@backendkit-labs/agent-core": "^0.17.0",
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "dotenv": "^16.4.7",
+    "openai": "^6.40.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.12",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.3"
+  }
+}

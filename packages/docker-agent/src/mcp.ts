@@ -8,7 +8,7 @@ import { z } from 'zod';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnySchema = any;
-import { createInfraEngine } from './engine';
+import { createDockerEngine } from './engine';
 import { loadConfig } from './config';
 
 // ── Engine runner ────────────────────────────────────────────────────────────
@@ -43,7 +43,7 @@ function runWithEngine(prompt: string): Promise<string> {
           break;
       }
     });
-    const engine = createInfraEngine(transport);
+    const engine = createDockerEngine(transport);
     engine.run(prompt).catch(reject);
   });
 }
@@ -52,9 +52,9 @@ function mcpHandler(buildPrompt: (args: Record<string, unknown>) => string) {
   return async (args: Record<string, unknown>) => {
     const start = Date.now();
     const prompt = buildPrompt(args);
-    process.stderr.write(`[infra-agent] ← ${prompt.slice(0, 80)}\n`);
+    process.stderr.write(`[docker-agent] ← ${prompt.slice(0, 80)}\n`);
     const result = await runWithEngine(prompt);
-    process.stderr.write(`[infra-agent] → done in ${Date.now() - start}ms\n`);
+    process.stderr.write(`[docker-agent] → done in ${Date.now() - start}ms\n`);
     return { content: [{ type: 'text' as const, text: result }] };
   };
 }
@@ -62,7 +62,7 @@ function mcpHandler(buildPrompt: (args: Record<string, unknown>) => string) {
 // ── MCP server builder ───────────────────────────────────────────────────────
 
 function buildMcpServer(): McpServer {
-  const srv = new McpServer({ name: 'infra-agent', version: '0.2.0' });
+  const srv = new McpServer({ name: 'docker-agent', version: '0.2.0' });
 
   srv.tool(
     'infra_execute',
@@ -184,7 +184,7 @@ async function startHttp(): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
     server.listen(config.mcpPort, config.mcpHost, () => {
-      process.stderr.write(`[infra-agent] HTTP MCP server listening on http://${config.mcpHost}:${config.mcpPort}/mcp\n`);
+      process.stderr.write(`[docker-agent] HTTP MCP server listening on http://${config.mcpHost}:${config.mcpPort}/mcp\n`);
       resolve();
     });
   });
@@ -193,7 +193,7 @@ async function startHttp(): Promise<void> {
 async function startStdio(): Promise<void> {
   const transport = new StdioServerTransport();
   await buildMcpServer().connect(transport);
-  process.stderr.write('[infra-agent] Stdio MCP server ready\n');
+  process.stderr.write('[docker-agent] Stdio MCP server ready\n');
 }
 
 // Start mode: stdio if no TTY (subprocess), HTTP otherwise

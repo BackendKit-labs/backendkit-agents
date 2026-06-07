@@ -1,5 +1,5 @@
 import { CallbackTransport } from '@backendkit-labs/agent-core';
-import { createInfraEngine } from './engine';
+import { createDockerEngine } from './engine';
 import { loadConfig } from './config';
 
 function renderEvent(event: Parameters<CallbackTransport['emit']>[0]): void {
@@ -48,7 +48,7 @@ async function main(): Promise<void> {
   }
 
   const transport = new CallbackTransport(renderEvent);
-  const engine = createInfraEngine(transport);
+  const engine = createDockerEngine(transport);
 
   const input =
     process.argv[2] ||
