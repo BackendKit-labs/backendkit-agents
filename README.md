@@ -69,9 +69,14 @@ Phase 1: Auth Module
   ✅ VERIFY    → run tests, confirm all criteria pass
 ```
 
-Tools exposed: `design_init`, `design_status`, `design_next`, `design_advance`, `design_edit`, `design_overview`.
+**Document tools** (write to project cwd, tracked in git):
+`design_save_prompt`, `design_save_docs`, `design_read_context`
 
-State is persisted per project in `~/.{appName}/design/projects/{key}/design.json`.
+**Execution tools** (lifecycle state machine):
+`design_init`, `design_status`, `design_next`, `design_advance`, `design_edit`, `design_overview`
+
+Execution state is persisted in `~/.{appName}/projects/{key}/design.json`.
+Design documents (`prompt.md`, `specification.md`, `design.md`, `AGENT.md`, `ROADMAP.md`) live in the project directory.
 
 ## Repository structure
 
