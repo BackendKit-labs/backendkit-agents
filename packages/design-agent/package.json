@@ -19,7 +19,7 @@
   "license": "MIT",
   "engines": { "node": ">=20.0.0" },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc --noCheck",
     "start": "node dist/server.js",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "npm run build"
