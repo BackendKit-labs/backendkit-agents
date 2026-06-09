@@ -1,6 +1,6 @@
 {
   "name": "@backendkit-labs/design-agent",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Spec-driven design lifecycle MCP plugin — roadmap, phases (spec→implement→verify), multi-project overview.",
   "main": "dist/server.js",
   "bin": {
