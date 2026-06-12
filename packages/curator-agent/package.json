@@ -1,6 +1,6 @@
 {
   "name": "@backendkit-labs/curator-agent",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Knowledge Curator — intelligent document ingestion into enterprise vaults using powerful LLMs.",
   "main": "dist/server.js",
   "bin": {
@@ -20,10 +20,12 @@
     "build": "tsc --noCheck",
     "start": "node dist/server.js",
     "watch-vault": "node dist/watcher.js",
+    "ingest-ai": "tsx scripts/ingest-ai-engineering.ts",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.55.0",
     "@modelcontextprotocol/sdk": "^1.12.0",
     "openai": "^6.40.0",
     "zod": "^3.25.0"
