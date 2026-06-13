@@ -14,7 +14,7 @@ cp .env.example .env
 
 # Edit with your credentials
 # CURATOR_API_KEY=sk-your-key
-# CURATOR_VAULT_PATH=/path/to/vault
+# CURATOR_OUTPUT_PATH=/path/to/vault
 ```
 
 ### 2. Prepare Vault Structure
@@ -121,7 +121,7 @@ Edit `.env` with your API key and vault path:
 
 ```env
 CURATOR_API_KEY=sk-your-deepseek-key-here
-CURATOR_VAULT_PATH=C:\Users\mairon.cuello\development\workspace-ia\agent-framework-examples\bk-agent-vault
+CURATOR_OUTPUT_PATH=C:\Users\mairon.cuello\development\workspace-ia\agent-framework-examples\bk-agent-vault
 CURATOR_PROVIDER=deepseek
 CURATOR_MODEL=deepseek-reasoner
 ```
@@ -143,7 +143,7 @@ node -r dotenv/config ./dist/watcher.js
 CURATOR_API_KEY=sk-...
 
 # Absolute path to vault root
-CURATOR_VAULT_PATH=/path/to/vault
+CURATOR_OUTPUT_PATH=/path/to/vault
 ```
 
 ### Optional Environment Variables
@@ -181,7 +181,7 @@ mkdir vault/incoming vault/processed vault/failed
 **Run watcher:**
 ```bash
 export CURATOR_API_KEY="sk-your-key"
-export CURATOR_VAULT_PATH="/path/to/vault"
+export CURATOR_OUTPUT_PATH="/path/to/vault"
 
 npx @backendkit-labs/curator-agent curator-watcher
 ```
@@ -198,7 +198,7 @@ Files are curated into semantic notes within seconds.
 
 ```bash
 export CURATOR_API_KEY="sk-your-key"
-export CURATOR_VAULT_PATH="/path/to/vault"
+export CURATOR_OUTPUT_PATH="/path/to/vault"
 
 npx @backendkit-labs/curator-agent curator-ingest-file \
   --file "/path/to/document.md"
@@ -218,7 +218,7 @@ Add to `claude_desktop_config.json`:
       "args": ["-y", "@backendkit-labs/curator-agent"],
       "env": {
         "CURATOR_API_KEY": "sk-...",
-        "CURATOR_VAULT_PATH": "/path/to/vault",
+        "CURATOR_OUTPUT_PATH": "/path/to/vault",
         "CURATOR_PROVIDER": "deepseek",
         "CURATOR_MODEL": "deepseek-reasoner"
       }
@@ -279,7 +279,7 @@ const curator = new KnowledgeCurator({
     apiKey: process.env.CURATOR_API_KEY!,
     model: 'deepseek-reasoner',
   }),
-  vaultPath: process.env.CURATOR_VAULT_PATH!,
+  vaultPath: process.env.CURATOR_OUTPUT_PATH!,
 });
 
 // Process documentation
@@ -460,7 +460,7 @@ Knowledge extraction is cognitively demanding:
 ```bash
 # Process 15 technical documentation files
 export CURATOR_API_KEY="sk-..."
-export CURATOR_VAULT_PATH="/path/to/bk-agent-vault"
+export CURATOR_OUTPUT_PATH="/path/to/bk-agent-vault"
 export CURATOR_MODEL="deepseek-reasoner"
 
 # Method 1: Watcher (auto-detects new files)
@@ -518,11 +518,11 @@ vault/
    ```env
    # ✅ Correct
    CURATOR_API_KEY=sk-your-key
-   CURATOR_VAULT_PATH=/path/to/vault
+   CURATOR_OUTPUT_PATH=/path/to/vault
    
    # ❌ Wrong (don't add quotes)
    CURATOR_API_KEY="sk-your-key"
-   CURATOR_VAULT_PATH="/path/to/vault"
+   CURATOR_OUTPUT_PATH="/path/to/vault"
    ```
 
 3. **Use correct npm script:**

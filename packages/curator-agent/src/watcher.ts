@@ -7,7 +7,7 @@
  *
  * Required env vars:
  *   CURATOR_API_KEY    — DeepSeek / OpenAI-compatible API key
- *   CURATOR_VAULT_PATH — absolute path to the shared vault (where notes are written)
+ *   CURATOR_OUTPUT_PATH — absolute path to the shared vault (where notes are written)
  *
  * Optional:
  *   CURATOR_INPUT_PATH  — path to documents to curate (if set: process once; if not: watch vault/incoming/)
@@ -22,10 +22,10 @@
  *
  * Run:
  *   # Mode 1: Watch incoming/
- *   CURATOR_API_KEY=sk-... CURATOR_VAULT_PATH=/vault node dist/watcher.js
+ *   CURATOR_API_KEY=sk-... CURATOR_OUTPUT_PATH=/vault node dist/watcher.js
  *
  *   # Mode 2: Direct input path with progress
- *   CURATOR_INPUT_PATH=/docs CURATOR_VAULT_PATH=/vault CURATOR_API_KEY=sk-... node dist/watcher.js
+ *   CURATOR_INPUT_PATH=/docs CURATOR_OUTPUT_PATH=/vault CURATOR_API_KEY=sk-... node dist/watcher.js
  *
  * Webhook (when CURATOR_HTTP_PORT is set):
  *   POST http://localhost:3099/ingest
@@ -44,7 +44,7 @@ import type { CurationResult } from './types.js';
 
 // ── Config ─────────────────────────────────────────────────────────────────────
 
-const VAULT_PATH    = process.env.CURATOR_VAULT_PATH ?? '';
+const VAULT_PATH    = process.env.CURATOR_OUTPUT_PATH ?? '';
 const INPUT_PATH    = process.env.CURATOR_INPUT_PATH ?? null;
 const HTTP_PORT     = process.env.CURATOR_HTTP_PORT ? parseInt(process.env.CURATOR_HTTP_PORT) : null;
 const POLL_MS       = parseInt(process.env.CURATOR_POLL_MS ?? '30000');
@@ -52,7 +52,7 @@ const USE_INCOMING  = !INPUT_PATH; // true if INPUT_PATH not set, use vault/inco
 
 function validate(): void {
     if (!process.env.CURATOR_API_KEY) { console.error('✗  CURATOR_API_KEY is required'); process.exit(1); }
-    if (!VAULT_PATH)                  { console.error('✗  CURATOR_VAULT_PATH is required'); process.exit(1); }
+    if (!VAULT_PATH)                  { console.error('✗  CURATOR_OUTPUT_PATH is required'); process.exit(1); }
     if (INPUT_PATH) {
         try {
             fsSync.accessSync(INPUT_PATH, fsSync.constants.R_OK);

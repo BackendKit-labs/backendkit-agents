@@ -8,7 +8,7 @@
  *
  * Required env vars:
  *   CURATOR_API_KEY    — provider API key
- *   CURATOR_VAULT_PATH — absolute path to the vault
+ *   CURATOR_OUTPUT_PATH — absolute path to the vault
  *
  * Optional:
  *   CURATOR_PORT         — HTTP port (e.g. 3100). If set, serves HTTP MCP.
@@ -26,7 +26,7 @@
  *         "args": ["-y", "@backendkit-labs/curator-agent"],
  *         "env": {
  *           "CURATOR_API_KEY":    "sk-...",
- *           "CURATOR_VAULT_PATH": "/path/to/vault"
+ *           "CURATOR_OUTPUT_PATH": "/path/to/vault"
  *         }
  *       }
  *     }
@@ -47,7 +47,7 @@ import type { ProcessResult }               from './agent.js';
 // ── Config ────────────────────────────────────────────────────────────────────
 
 const API_KEY        = process.env.CURATOR_API_KEY ?? '';
-const VAULT_PATH     = process.env.CURATOR_VAULT_PATH ?? '';
+const VAULT_PATH     = process.env.CURATOR_OUTPUT_PATH ?? '';
 const MODEL          = process.env.CURATOR_MODEL ?? 'deepseek-chat';
 const RESEARCH_MODEL = process.env.CURATOR_RESEARCH_MODEL ?? 'deepseek-chat';
 const BASE_URL       = process.env.CURATOR_BASE_URL;
@@ -56,7 +56,7 @@ const VM_ID          = process.env.VAULT_MANAGER_ID;
 const PORT           = process.env.CURATOR_PORT ? parseInt(process.env.CURATOR_PORT) : null;
 
 if (!API_KEY)    { process.stderr.write('[curator] CURATOR_API_KEY is required\n'); process.exit(1); }
-if (!VAULT_PATH) { process.stderr.write('[curator] CURATOR_VAULT_PATH is required\n'); process.exit(1); }
+if (!VAULT_PATH) { process.stderr.write('[curator] CURATOR_OUTPUT_PATH is required\n'); process.exit(1); }
 
 // ── Agent singleton ───────────────────────────────────────────────────────────
 
