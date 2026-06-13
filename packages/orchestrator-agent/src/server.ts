@@ -842,9 +842,93 @@ srv.tool(
     },
 );
 
+// ---------------------------------------------------------------------------
+// orchestrator_list_runs — list persisted runs with status summary
+// ---------------------------------------------------------------------------
+// @ts-ignore
+srv.tool(
+    'orchestrator_list_runs',
+    'List all persisted orchestration runs with their current status. Runs survive server restarts — use this to see what happened before a restart or to find a run_id.',
+    {
+        status: z.enum(['running', 'waiting_gate', 'complete', 'failed', 'all']).default('all')
+            .describe('Filter by status. Default: all'),
+        limit: z.number().int().min(1).max(100).default(20)
+            .describe('Maximum number of runs to return (most recent first). Default: 20'),
+    },
+    async ({ status, limit }) => {
+        const all  = store.list();
+        const runs = (status === 'all' ? all : all.filter(r => r.status === status))
+            .slice(0, limit);
+
+        if (runs.length === 0) {
+            return ok(status === 'all'
+                ? 'No runs found.'
+                : `No runs with status "${status}".`);
+        }
+
+        const STATUS_ICON: Record<string, string> = {
+            running:      '⏳',
+            waiting_gate: '⏸',
+            complete:     '✓',
+            failed:       '✗',
+        };
+
+        const lines = [
+            `## Runs (${runs.length}${status !== 'all' ? ` · status=${status}` : ''})`,
+            '',
+        ];
+
+        for (const r of runs) {
+            const icon     = STATUS_ICON[r.status] ?? '?';
+            const taskSnip = r.task.slice(0, 70);
+            const when     = r.startedAt.slice(0, 16).replace('T', ' ');
+            lines.push(`${icon} \`${r.runId}\`  **${r.status}**  ${when}`);
+            lines.push(`   ${taskSnip}`);
+            if (r.status === 'waiting_gate' && r.waitingGate) {
+                lines.push(`   ⏸ gate: step \`${r.waitingGate.stepId}\` — use \`orchestrator_approve\``);
+            }
+            if (r.status === 'failed' && r.error) {
+                lines.push(`   ✗ ${r.error.slice(0, 120)}`);
+            }
+            lines.push('');
+        }
+
+        if (all.length > limit) {
+            lines.push(`_(showing ${limit} of ${all.length} total — increase limit or filter by status)_`);
+        }
+
+        return ok(lines.join('\n'));
+    },
+);
+
 // ── Start ─────────────────────────────────────────────────────────────────────
 
 async function main() {
+    // Recovery: runs stuck in 'running' when the server last crashed will never
+    // resume on their own. Mark them as failed so they appear correctly in
+    // orchestrator_list_runs. waiting_gate runs are intentionally skipped —
+    // they survive restarts fine (orchestrator_approve resumes them normally).
+    const interrupted = store.list().filter(r => r.status === 'running');
+    for (const run of interrupted) {
+        store.save({
+            ...run,
+            status:      'failed',
+            completedAt: new Date().toISOString(),
+            error:       'Server restarted while run was in progress. Re-run the task with orchestrator_run.',
+        });
+    }
+    if (interrupted.length > 0) {
+        process.stderr.write(
+            `[orchestrator-agent] Marked ${interrupted.length} interrupted run(s) as failed\n`,
+        );
+    }
+
+    // Prune runs older than 30 days (terminal states only)
+    const pruned = store.prune(30);
+    if (pruned > 0) {
+        process.stderr.write(`[orchestrator-agent] Pruned ${pruned} old run file(s)\n`);
+    }
+
     const transport = new StdioServerTransport();
     await srv.connect(transport);
     process.stderr.write('[orchestrator-agent] Running\n');

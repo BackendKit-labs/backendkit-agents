@@ -77,4 +77,49 @@ export class RunStore {
             return null;
         }
     }
+
+    /**
+     * Lists all persisted runs, sorted by startedAt descending (most recent first).
+     * Silently skips unreadable files.
+     */
+    list(): RunState[] {
+        let files: string[];
+        try {
+            files = fs.readdirSync(this.dir).filter(f => f.endsWith('.json'));
+        } catch {
+            return [];
+        }
+        const runs: RunState[] = [];
+        for (const file of files) {
+            try {
+                const state = JSON.parse(
+                    fs.readFileSync(path.join(this.dir, file), 'utf-8'),
+                ) as RunState;
+                runs.push(state);
+            } catch { /* skip corrupt files */ }
+        }
+        return runs.sort((a, b) =>
+            new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime(),
+        );
+    }
+
+    /**
+     * Removes run files older than `maxAgeDays` days that are in a terminal state
+     * (complete or failed). Leaves running/waiting_gate runs untouched.
+     */
+    prune(maxAgeDays = 30): number {
+        const cutoff = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
+        let removed = 0;
+        for (const run of this.list()) {
+            if (run.status !== 'complete' && run.status !== 'failed') continue;
+            const age = new Date(run.startedAt).getTime();
+            if (age < cutoff) {
+                try {
+                    fs.unlinkSync(path.join(this.dir, `${run.runId}.json`));
+                    removed++;
+                } catch { /* ignore */ }
+            }
+        }
+        return removed;
+    }
 }
