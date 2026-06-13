@@ -22,7 +22,6 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import * as path from 'node:path';
-import * as os from 'node:os';
 import * as fs from 'node:fs';
 import {
     ObsidianRAGProvider,
@@ -43,9 +42,51 @@ import type { ReflectionAdapter }                from './executor.js';
 const ok  = (text: string) => ({ content: [{ type: 'text' as const, text }] });
 const ts  = () => new Date().toISOString();
 
-// ── Shared state ──────────────────────────────────────────────────────────────
+// ── Data directory + RunStore ─────────────────────────────────────────────────
+// Data lives adjacent to the config file, NOT in ~/.bk-agent (that belongs to
+// the coding agent). Override with ORCHESTRATOR_DATA_DIR env var (Docker/CI)
+// or data_dir key in orchestrator.yaml.
 
-const store = new RunStore();
+function resolveDataDir(configPath: string, config?: OrchestratorConfig): string {
+    if (process.env['ORCHESTRATOR_DATA_DIR']) return process.env['ORCHESTRATOR_DATA_DIR'];
+    if (config?.orchestrator.data_dir) {
+        return path.resolve(path.dirname(path.resolve(configPath)), config.orchestrator.data_dir);
+    }
+    return path.join(path.dirname(path.resolve(configPath)), '.orchestrator');
+}
+
+const storeCache = new Map<string, RunStore>();
+
+function getStore(configPath: string, config?: OrchestratorConfig): RunStore {
+    const key = path.resolve(configPath);
+    if (storeCache.has(key)) return storeCache.get(key)!;
+
+    const store = new RunStore(path.join(resolveDataDir(key, config), 'runs'));
+    storeCache.set(key, store);
+
+    // Recovery: runs stuck in 'running' when server last crashed won't resume on
+    // their own. Mark them failed. waiting_gate runs are left untouched — they
+    // survive restarts because orchestrator_approve resumes from disk state.
+    const interrupted = store.list().filter(r => r.status === 'running');
+    for (const run of interrupted) {
+        store.save({
+            ...run,
+            status:      'failed',
+            completedAt: new Date().toISOString(),
+            error:       'Server restarted while run was in progress. Re-run the task with orchestrator_run.',
+        });
+    }
+    if (interrupted.length > 0) {
+        process.stderr.write(`[orchestrator-agent] Marked ${interrupted.length} interrupted run(s) as failed\n`);
+    }
+
+    const pruned = store.prune(30);
+    if (pruned > 0) {
+        process.stderr.write(`[orchestrator-agent] Pruned ${pruned} old run file(s)\n`);
+    }
+
+    return store;
+}
 
 // ── Enterprise reflection (Cable 1 + 2) ──────────────────────────────────────
 // Lazy-initialized per vault path. Uses EnterpriseReflection from
@@ -104,13 +145,13 @@ async function getReflection(vaultPath: string): Promise<ReflectionFull | undefi
 
 // ── RAG setup ─────────────────────────────────────────────────────────────────
 
-async function buildRAG(config: OrchestratorConfig): Promise<{
+async function buildRAG(config: OrchestratorConfig, dataDir: string): Promise<{
     search: (q: string) => Promise<string>;
 } | null> {
     const vaultCfg = config.orchestrator.vault;
     if (!vaultCfg) return null;
 
-    const indexDir  = path.join(os.homedir(), '.bk-agent', 'rag', 'orchestrator');
+    const indexDir = path.join(dataDir, 'rag');
     fs.mkdirSync(indexDir, { recursive: true });
 
     const embedder = vaultCfg.embedder === 'ollama'
@@ -206,11 +247,13 @@ async function planDynamic(
  */
 async function executeInBackground(
     runId:        string,
+    configPath:   string,
     config:       OrchestratorConfig,
     plan:         unknown,
     rag:          { search: (q: string) => Promise<string> } | null,
     priorResults: ExecutionResult[] = [],
 ): Promise<void> {
+    const store = getStore(configPath, config);
     const state = store.load(runId);
     if (!state) return;
 
@@ -223,7 +266,6 @@ async function executeInBackground(
         config,
         ragSearchFn: rag?.search,
         reflection,
-        // Mark each step as "in progress" in the RunStore before running it
         onProgress: (msg) => {
             const match = msg.match(/\[([^\]]+)\]/);
             if (match) {
@@ -333,10 +375,12 @@ srv.tool(
             return ok(`Config error: ${err instanceof Error ? err.message : String(err)}`);
         }
 
-        const rag        = await buildRAG(config).catch(() => null);
+        const dataDir    = resolveDataDir(config_path, config);
+        const rag        = await buildRAG(config, dataDir).catch(() => null);
         const reflection = config.orchestrator.vault
             ? await getReflection(config.orchestrator.vault.path).catch(() => undefined)
             : undefined;
+        const store      = getStore(config_path, config);
         const configDir  = path.dirname(path.resolve(config_path));
 
         // ── Resolve plan: static flow or dynamic TaskPlanner ─────────────────
@@ -389,7 +433,7 @@ srv.tool(
         store.save(state);
 
         setImmediate(() => {
-            executeInBackground(runId, config, plan, rag).catch((err) => {
+            executeInBackground(runId, config_path, config, plan, rag).catch((err) => {
                 const s = store.load(runId);
                 if (s) store.save({ ...s, status: 'failed', error: String(err) });
             });
@@ -423,11 +467,20 @@ srv.tool(
     'orchestrator_approve',
     'Approve or reject a gate that paused a running orchestration. If approved, execution resumes automatically.',
     {
-        run_id:   z.string().describe('Run ID returned by orchestrator_run'),
-        approved: z.boolean().describe('true to approve and continue, false to reject and stop'),
-        notes:    z.string().optional().describe('Optional notes from the approver (required when rejecting)'),
+        config_path: z.string().describe('Absolute path to orchestrator.yaml — same value used in orchestrator_run'),
+        run_id:      z.string().describe('Run ID returned by orchestrator_run'),
+        approved:    z.boolean().describe('true to approve and continue, false to reject and stop'),
+        notes:       z.string().optional().describe('Optional notes from the approver (required when rejecting)'),
     },
-    async ({ run_id, approved, notes }) => {
+    async ({ config_path, run_id, approved, notes }) => {
+        let config: OrchestratorConfig;
+        try {
+            config = loadConfig(config_path);
+        } catch (err) {
+            return ok(`Config error: ${err instanceof Error ? err.message : String(err)}`);
+        }
+
+        const store = getStore(config_path, config);
         const state = store.load(run_id);
         if (!state) return ok(`Run not found: ${run_id}`);
         if (state.status !== 'waiting_gate') {
@@ -435,14 +488,6 @@ srv.tool(
         }
 
         const gate = state.waitingGate!;
-
-        // Reload config early — needed for reflection in both approve and reject paths
-        let config: OrchestratorConfig;
-        try {
-            config = loadConfig(state.configPath);
-        } catch (err) {
-            return ok(`Config error on resume: ${err instanceof Error ? err.message : String(err)}`);
-        }
 
         // Cable 2: record rule outcomes so the reflection engine tracks effectiveness
         const reflection = config.orchestrator.vault
@@ -471,7 +516,7 @@ srv.tool(
             ].filter(Boolean).join('\n'));
         }
 
-        const rag = await buildRAG(config).catch(() => null);
+        const rag = await buildRAG(config, resolveDataDir(config_path, config)).catch(() => null);
 
         // Mark gate as cleared, resume in background
         const resumeState: RunState = {
@@ -491,7 +536,7 @@ srv.tool(
         }));
 
         setImmediate(() => {
-            executeInBackground(run_id, config, state.plan, rag, priorResults).catch((err) => {
+            executeInBackground(run_id, config_path, config, state.plan, rag, priorResults).catch((err) => {
                 const s = store.load(run_id);
                 if (s) store.save({ ...s, status: 'failed', error: String(err) });
             });
@@ -555,10 +600,11 @@ srv.tool(
     'orchestrator_status',
     'Get the status of a running or completed orchestration by runId.',
     {
-        run_id: z.string().describe('Run ID returned by orchestrator_run'),
+        config_path: z.string().describe('Absolute path to orchestrator.yaml — same value used in orchestrator_run'),
+        run_id:      z.string().describe('Run ID returned by orchestrator_run'),
     },
-    async ({ run_id }) => {
-        const state = store.load(run_id);
+    async ({ config_path, run_id }) => {
+        const state = getStore(config_path).load(run_id);
         if (!state) return ok(`Run not found: ${run_id}`);
 
         const lines: string[] = [
@@ -850,13 +896,14 @@ srv.tool(
     'orchestrator_list_runs',
     'List all persisted orchestration runs with their current status. Runs survive server restarts — use this to see what happened before a restart or to find a run_id.',
     {
+        config_path: z.string().describe('Absolute path to orchestrator.yaml'),
         status: z.enum(['running', 'waiting_gate', 'complete', 'failed', 'all']).default('all')
             .describe('Filter by status. Default: all'),
         limit: z.number().int().min(1).max(100).default(20)
             .describe('Maximum number of runs to return (most recent first). Default: 20'),
     },
-    async ({ status, limit }) => {
-        const all  = store.list();
+    async ({ config_path, status, limit }) => {
+        const all  = getStore(config_path).list();
         const runs = (status === 'all' ? all : all.filter(r => r.status === status))
             .slice(0, limit);
 
@@ -904,31 +951,6 @@ srv.tool(
 // ── Start ─────────────────────────────────────────────────────────────────────
 
 async function main() {
-    // Recovery: runs stuck in 'running' when the server last crashed will never
-    // resume on their own. Mark them as failed so they appear correctly in
-    // orchestrator_list_runs. waiting_gate runs are intentionally skipped —
-    // they survive restarts fine (orchestrator_approve resumes them normally).
-    const interrupted = store.list().filter(r => r.status === 'running');
-    for (const run of interrupted) {
-        store.save({
-            ...run,
-            status:      'failed',
-            completedAt: new Date().toISOString(),
-            error:       'Server restarted while run was in progress. Re-run the task with orchestrator_run.',
-        });
-    }
-    if (interrupted.length > 0) {
-        process.stderr.write(
-            `[orchestrator-agent] Marked ${interrupted.length} interrupted run(s) as failed\n`,
-        );
-    }
-
-    // Prune runs older than 30 days (terminal states only)
-    const pruned = store.prune(30);
-    if (pruned > 0) {
-        process.stderr.write(`[orchestrator-agent] Pruned ${pruned} old run file(s)\n`);
-    }
-
     const transport = new StdioServerTransport();
     await srv.connect(transport);
     process.stderr.write('[orchestrator-agent] Running\n');

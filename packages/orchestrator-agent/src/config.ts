@@ -53,10 +53,12 @@ const FlowEntryConfigSchema = z.object({
 export const OrchestratorConfigSchema = z.object({
     version: z.number().default(1),
     orchestrator: z.object({
-        name: z.string().default('Orchestrator'),
+        name:     z.string().default('Orchestrator'),
         provider: z.string().default('default'),
-        model: z.string().optional(),
-        vault: VaultConfigSchema.optional(),
+        model:    z.string().optional(),
+        vault:    VaultConfigSchema.optional(),
+        /** Override where runs and RAG index are stored. Default: .orchestrator/ adjacent to this file. */
+        data_dir: z.string().optional(),
     }),
     providers: z.record(ProviderConfigSchema).default({}),
     agents:    z.array(AgentConfigSchema).min(1, 'At least one agent must be configured'),
