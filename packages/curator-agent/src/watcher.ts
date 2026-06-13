@@ -160,7 +160,7 @@ async function scanIncoming(): Promise<void> {
     }
 }
 
-function startPolling(): void {
+async function startPolling(): Promise<void> {
     if (USE_INCOMING) {
         // Traditional mode: watch vault/incoming/
         fsSync.mkdirSync(INCOMING, { recursive: true });
@@ -184,7 +184,9 @@ function startPolling(): void {
         scanIncoming();
     } else {
         // Direct mode: process INPUT_PATH once with progress bar
-        processInputDirectory();
+        await processInputDirectory();
+        // Exit cleanly after processing
+        process.exit(0);
     }
 }
 
@@ -239,12 +241,19 @@ function startHttpServer(port: number): void {
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
-validate();
-log(`Vault:    ${VAULT_PATH}`);
-log(`Mode:     ${USE_INCOMING ? 'Watch vault/incoming/' : 'Process INPUT_PATH once'}`);
-if (INPUT_PATH) log(`Input:    ${INPUT_PATH}`);
-log(`Provider: ${process.env.CURATOR_PROVIDER ?? 'deepseek'}`);
-log(`Model:    ${process.env.CURATOR_MODEL ?? 'deepseek-reasoner'}`);
+async function main(): Promise<void> {
+    validate();
+    log(`Vault:    ${VAULT_PATH}`);
+    log(`Mode:     ${USE_INCOMING ? 'Watch vault/incoming/' : 'Process INPUT_PATH once'}`);
+    if (INPUT_PATH) log(`Input:    ${INPUT_PATH}`);
+    log(`Provider: ${process.env.CURATOR_PROVIDER ?? 'deepseek'}`);
+    log(`Model:    ${process.env.CURATOR_MODEL ?? 'deepseek-reasoner'}`);
 
-startPolling();
-if (HTTP_PORT) startHttpServer(HTTP_PORT);
+    await startPolling();
+    if (HTTP_PORT) startHttpServer(HTTP_PORT);
+}
+
+main().catch(err => {
+    console.error(`[curator-watcher] Fatal: ${(err as Error).message}`);
+    process.exit(1);
+});
