@@ -126,6 +126,9 @@ async function processInputDirectory(): Promise<void> {
             console.log(`✗ ${(err as Error).message}`);
             failed++;
         }
+
+        // Separator line between progress bars
+        console.log('');
     }
 
     console.log(`\n✨ Curation complete: ${succeeded} succeeded, ${failed} failed\n`);
