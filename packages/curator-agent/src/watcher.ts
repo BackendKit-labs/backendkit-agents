@@ -110,7 +110,8 @@ async function processInputDirectory(): Promise<void> {
 
         try {
             const curator = makeCurator();
-            await curator.curateFile(filePath);
+            // archiveAfter: false → Keep original files untouched in INPUT_PATH
+            await curator.curateFile(filePath, undefined, false);
             succeeded++;
             console.log('✓');
         } catch (err) {

@@ -161,9 +161,11 @@ export class KnowledgeCurator {
 
     /**
      * Curate a file on disk.
-     * After processing, moves it to vault/processed/ (or vault/failed/ on error).
+     * @param filePath - Path to the file
+     * @param areaHint - Optional area classification hint
+     * @param archiveAfter - Whether to move file to processed/failed folder (default: true for watcher mode)
      */
-    async curateFile(filePath: string, areaHint?: string): Promise<CurationResult> {
+    async curateFile(filePath: string, areaHint?: string, archiveAfter: boolean = true): Promise<CurationResult> {
         let text: string;
         try {
             text = await fs.readFile(filePath, 'utf-8');
@@ -178,7 +180,11 @@ export class KnowledgeCurator {
         const source = path.basename(filePath);
         const result = await this.curateText(text, source, areaHint);
 
-        await this.archiveFile(filePath, result.errors.length > 0 && !result.notesWritten.length);
+        // Only archive (move) file if archiveAfter is true
+        // Set to false for direct INPUT_PATH mode to keep originals untouched
+        if (archiveAfter) {
+            await this.archiveFile(filePath, result.errors.length > 0 && !result.notesWritten.length);
+        }
         return result;
     }
 
