@@ -47,6 +47,7 @@ import {
     hasFileChanged,
     updateManifestEntry,
     generateReport,
+    findAllFiles,
 } from './checksum.js';
 import type { CurationResult } from './types.js';
 
@@ -96,10 +97,11 @@ function buildProgressBar(current: number, total: number, width: number = 40): s
 async function processInputDirectory(): Promise<void> {
     if (!INPUT_PATH) return;
 
-    let files: string[];
+    // Recursively find all markdown and text files
+    let files: Array<{ fullPath: string; relativePath: string }>;
     try {
-        const entries = await fs.readdir(INPUT_PATH);
-        files = entries.filter(f => (f.endsWith('.md') || f.endsWith('.txt')) && !f.startsWith('.')).sort();
+        files = await findAllFiles(INPUT_PATH);
+        files.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
     } catch (err) {
         log(`✗ Failed to read INPUT_PATH: ${(err as Error).message}`);
         return;
@@ -114,6 +116,7 @@ async function processInputDirectory(): Promise<void> {
     let manifest = await loadManifest(INPUT_PATH);
     if (!manifest) {
         manifest = createManifest(INPUT_PATH, VAULT_PATH);
+        log(`\n💡 No manifest found. Will process ALL ${files.length} files to build initial index.\n`);
     }
 
     console.log(`\n📚 Processing ${files.length} files...\n`);
@@ -123,34 +126,33 @@ async function processInputDirectory(): Promise<void> {
     let skipped = 0;
 
     for (let i = 0; i < files.length; i++) {
-        const file = files[i];
-        const filePath = path.join(INPUT_PATH, file);
+        const { fullPath: filePath, relativePath } = files[i];
         const counter = `[${i + 1}/${files.length}]`;
         const progressBar = buildProgressBar(i + 1, files.length);
 
         try {
             // Check if file changed since last curation
-            const changed = await hasFileChanged(filePath, manifest);
+            const changed = await hasFileChanged(filePath, relativePath, manifest);
 
             if (!changed) {
-                console.log(`  ${counter} ${progressBar} ${file}... ⊘ (unchanged)`);
-                await updateManifestEntry(manifest, filePath, 'skipped');
+                console.log(`  ${counter} ${progressBar} ${relativePath}... ⊘ (unchanged)`);
+                await updateManifestEntry(manifest, filePath, relativePath, 'skipped');
                 skipped++;
             } else {
-                // Show progress: counter, bar, and filename
-                process.stdout.write(`  ${counter} ${progressBar} ${file}... `);
+                // Show progress: counter, bar, and relative path
+                process.stdout.write(`  ${counter} ${progressBar} ${relativePath}... `);
 
                 const curator = makeCurator();
                 // archiveAfter: false → Keep original files untouched in INPUT_PATH
                 await curator.curateFile(filePath, undefined, false);
                 succeeded++;
-                await updateManifestEntry(manifest, filePath, 'success');
+                await updateManifestEntry(manifest, filePath, relativePath, 'success');
                 console.log('✓');
             }
         } catch (err) {
             console.log(`✗ ${(err as Error).message}`);
             failed++;
-            await updateManifestEntry(manifest, filePath, 'failed');
+            await updateManifestEntry(manifest, filePath, relativePath, 'failed');
         }
 
         // Separator line between progress bars

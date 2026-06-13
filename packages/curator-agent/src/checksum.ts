@@ -16,6 +16,7 @@ export interface CuratorManifest {
     inputPath: string;
     outputPath: string;
     files: Record<string, {
+        relativePath: string;  // e.g. "docs/intro.md" or "readme.md"
         hash: string;
         size: number;
         modified: string;
@@ -62,12 +63,12 @@ export async function saveManifest(
  */
 export async function hasFileChanged(
     filePath: string,
+    relativePath: string,
     manifest: CuratorManifest | null
 ): Promise<boolean> {
     if (!manifest) return true; // First run, all files are "new"
 
-    const filename = path.basename(filePath);
-    const entry = manifest.files[filename];
+    const entry = manifest.files[relativePath];
     if (!entry) return true; // Not in manifest, treat as new
 
     const currentHash = await calculateFileHash(filePath);
@@ -97,19 +98,63 @@ export function createManifest(
 export async function updateManifestEntry(
     manifest: CuratorManifest,
     filePath: string,
+    relativePath: string,
     status: 'success' | 'failed' | 'skipped'
 ): Promise<void> {
-    const filename = path.basename(filePath);
     const stat = await fs.stat(filePath);
     const hash = await calculateFileHash(filePath);
 
-    manifest.files[filename] = {
+    // Use relative path as key (e.g., "docs/intro.md")
+    manifest.files[relativePath] = {
+        relativePath,
         hash,
         size: stat.size,
         modified: new Date(stat.mtime).toISOString(),
         curatedAt: new Date().toISOString(),
         status,
     };
+}
+
+/**
+ * Recursively find all markdown and text files
+ */
+export async function findAllFiles(
+    dirPath: string,
+    relativePath: string = ''
+): Promise<Array<{ fullPath: string; relativePath: string }>> {
+    const results: Array<{ fullPath: string; relativePath: string }> = [];
+
+    try {
+        const entries = await fs.readdir(dirPath, { withFileTypes: true });
+
+        for (const entry of entries) {
+            // Skip hidden files and common ignore patterns
+            if (entry.name.startsWith('.') ||
+                entry.name === 'node_modules' ||
+                entry.name === 'dist' ||
+                entry.name === 'build') {
+                continue;
+            }
+
+            const fullPath = path.join(dirPath, entry.name);
+            const relPath = relativePath ? path.join(relativePath, entry.name) : entry.name;
+
+            if (entry.isDirectory()) {
+                // Recursively search subdirectories
+                const subResults = await findAllFiles(fullPath, relPath);
+                results.push(...subResults);
+            } else if (entry.isFile()) {
+                // Include markdown and text files
+                if (entry.name.endsWith('.md') || entry.name.endsWith('.txt')) {
+                    results.push({ fullPath, relativePath: relPath });
+                }
+            }
+        }
+    } catch (err) {
+        console.error(`Error reading directory ${dirPath}: ${(err as Error).message}`);
+    }
+
+    return results;
 }
 
 /**
