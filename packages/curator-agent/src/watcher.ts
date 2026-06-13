@@ -78,6 +78,13 @@ function summarise(r: CurationResult, label: string): void {
 
 // ── Process input directory with progress bar ─────────────────────────────────
 
+function buildProgressBar(current: number, total: number, width: number = 40): string {
+    const percent = Math.round((current / total) * 100);
+    const filled = Math.round((width * current) / total);
+    const bar = '█'.repeat(filled) + '░'.repeat(width - filled);
+    return `[${bar}] ${percent}%`;
+}
+
 async function processInputDirectory(): Promise<void> {
     if (!INPUT_PATH) return;
 
@@ -103,13 +110,12 @@ async function processInputDirectory(): Promise<void> {
     for (let i = 0; i < files.length; i++) {
         const file = files[i];
         const filePath = path.join(INPUT_PATH, file);
-        const progress = `[${i + 1}/${files.length}]`;
+        const counter = `[${i + 1}/${files.length}]`;
+        const progressBar = buildProgressBar(i + 1, files.length);
 
         try {
-            // Show which file is being processed with flush
-            const msg = `  ${progress} ${file}... `;
-            process.stdout.write(msg);
-            if (process.stdout.isTTY) process.stdout.write('');
+            // Show progress: counter, bar, and filename
+            process.stdout.write(`  ${counter} ${progressBar} ${file}... `);
 
             const curator = makeCurator();
             // archiveAfter: false → Keep original files untouched in INPUT_PATH
