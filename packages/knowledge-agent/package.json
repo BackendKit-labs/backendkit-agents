@@ -1,0 +1,38 @@
+{
+  "name": "@backendkit-labs/knowledge-agent",
+  "version": "0.1.0",
+  "description": "Knowledge Agent — conversational agent backed by any Obsidian vault. Ask questions, get expert answers, improve the vault over time.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "knowledge-agent": "./dist/repl.js"
+  },
+  "files": ["dist/", "AGENT.md"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BackendKit-labs/backendkit-agents.git",
+    "directory": "packages/knowledge-agent"
+  },
+  "publishConfig": { "access": "public" },
+  "license": "MIT",
+  "engines": { "node": ">=20.0.0" },
+  "scripts": {
+    "build":          "tsc --noCheck",
+    "dev":            "tsx src/repl.ts",
+    "start":          "node dist/repl.js",
+    "typecheck":      "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@backendkit-labs/agent-core":       "^0.20.2",
+    "@backendkit-labs/agent-enterprise": "^0.3.6",
+    "@backendkit-labs/curator-agent":    "^0.3.0",
+    "dotenv":                            "^16.0.0",
+    "openai":                            "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsx":         "^4.0.0",
+    "typescript":  "^5.4.0"
+  }
+}
