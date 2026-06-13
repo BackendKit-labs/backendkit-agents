@@ -53,14 +53,45 @@ const store = new RunStore();
 // No-op (undefined) with the current published version — both cables degrade
 // gracefully: Cable 1 skips recording, Cable 2 applies no extra gates.
 
-const reflectionCache = new Map<string, ReflectionAdapter>();
+// ReflectionFull extends the minimal Cable-2 interface with the human-facing
+// lifecycle methods (promotions, demotions, stats) used by orchestrator_reflect tools.
+// EnterpriseReflection from @backendkit-labs/agent-enterprise satisfies this structurally.
+interface ReflectionFull extends ReflectionAdapter {
+    pendingPromotions(): Promise<Array<{
+        pattern: {
+            domain: string; failureType: string; occurrences: number;
+            promotedToPolicy: boolean; [k: string]: unknown;
+        };
+        detectedAt: string;
+    }>>;
+    approvePromotion(
+        pattern:  Record<string, unknown>,
+        approver: string,
+    ): Promise<{ id: string; name: string; [k: string]: unknown }>;
+    rejectPromotion(
+        pattern:  Record<string, unknown>,
+        approver: string,
+        reason:   string,
+    ): Promise<void>;
+    demotionCandidates(opts?: { minFailureRatio?: number; minTotal?: number }): Promise<Array<{
+        id: string; name: string;
+        trigger: { domain: string; pattern: string; minOccurrences: number };
+        outcomes?: { success: number; failure: number };
+        [k: string]: unknown;
+    }>>;
+    approveDemotion(ruleId: string, approver: string, reason: string): Promise<boolean>;
+    stats(): Promise<Record<string, unknown>>;
+}
 
-async function getReflection(vaultPath: string): Promise<ReflectionAdapter | undefined> {
+const reflectionCache = new Map<string, ReflectionFull>();
+
+async function getReflection(vaultPath: string): Promise<ReflectionFull | undefined> {
     if (reflectionCache.has(vaultPath)) return reflectionCache.get(vaultPath);
     try {
         // Dynamic import so missing export in old package versions doesn't throw
         const lib = await import('@backendkit-labs/agent-enterprise') as Record<string, unknown>;
-        const EnterpriseReflection = lib['EnterpriseReflection'] as (new (o: { vaultPath: string }) => ReflectionAdapter & { initialize(): Promise<void> }) | undefined;
+        const EnterpriseReflection = lib['EnterpriseReflection'] as
+            (new (o: { vaultPath: string }) => ReflectionFull & { initialize(): Promise<void> }) | undefined;
         if (!EnterpriseReflection) return undefined;
         const r = new EnterpriseReflection({ vaultPath });
         await r.initialize();
@@ -527,6 +558,241 @@ srv.tool(
         }
 
         return ok(lines.filter(l => l !== undefined).join('\n'));
+    },
+);
+
+// ---------------------------------------------------------------------------
+// orchestrator_reflect — dashboard: pending promotions, active rules, demotion candidates
+// ---------------------------------------------------------------------------
+// @ts-ignore
+srv.tool(
+    'orchestrator_reflect',
+    'View enterprise reflection status: pending pattern promotions, active policy rules, and demotion candidates. Call this to understand what the system has learned from gate outcomes and to decide what to promote or demote.',
+    {
+        config_path: z.string().describe('Absolute path to orchestrator.yaml'),
+    },
+    async ({ config_path }) => {
+        let config: OrchestratorConfig;
+        try { config = loadConfig(config_path); }
+        catch (err) { return ok(`Config error: ${err instanceof Error ? err.message : String(err)}`); }
+
+        if (!config.orchestrator.vault) {
+            return ok('Vault not configured in orchestrator.yaml — reflection requires a vault path.');
+        }
+
+        const reflection = await getReflection(config.orchestrator.vault.path).catch(() => undefined);
+        if (!reflection) {
+            return ok('Enterprise reflection not available. Install @backendkit-labs/agent-enterprise >= 0.4.0.');
+        }
+
+        const [pending, active, demotable, statsData] = await Promise.all([
+            reflection.pendingPromotions().catch(() => []),
+            reflection.activeRules().catch(() => []),
+            reflection.demotionCandidates().catch(() => []),
+            reflection.stats().catch(() => ({} as Record<string, unknown>)),
+        ]);
+
+        const lines: string[] = [
+            `## Reflection Status — bk-enterprise`,
+            `vault: ${config.orchestrator.vault.path}`,
+            typeof statsData['catalogSize'] === 'number'
+                ? `catalog: ${statsData['catalogSize']} incidents`
+                : '',
+            `active rules: ${active.length} | pending promotions: ${pending.length} | demotion candidates: ${demotable.length}`,
+            '',
+        ];
+
+        // ── Pending Promotions ──────────────────────────────────────────────────
+        lines.push(`### Pending Promotions (${pending.length})`);
+        if (pending.length === 0) {
+            lines.push('None — no patterns have crossed the promotion threshold yet.');
+        } else {
+            lines.push('These patterns crossed the severity threshold. Approve to create a deterministic policy rule (Cable 2); reject to discard with audit note.');
+            lines.push('');
+            pending.forEach((p, i) => {
+                const key = `${p.pattern.domain}::${p.pattern.failureType}`;
+                lines.push(`**${i + 1}. ${key}**`);
+                lines.push(`   domain: ${p.pattern.domain} | failureType: ${p.pattern.failureType} | occurrences: ${p.pattern.occurrences}`);
+                lines.push(`   detected: ${p.detectedAt}`);
+                lines.push(`   → \`orchestrator_reflect_promote\`  promotion_id: "${key}"`);
+                lines.push('');
+            });
+        }
+
+        // ── Active Policy Rules ─────────────────────────────────────────────────
+        lines.push(`### Active Policy Rules (${active.length})`);
+        if (active.length === 0) {
+            lines.push('None — approve a pending promotion to create the first rule.');
+        } else {
+            lines.push('Enforced automatically before any matching step (Cable 2) — no LLM involved.');
+            lines.push('');
+            for (const r of active) {
+                const outs = (r as { outcomes?: { success: number; failure: number } }).outcomes;
+                const outcomeStr = outs
+                    ? `${outs.success} success / ${outs.failure} failure`
+                    : 'no outcomes recorded yet';
+                lines.push(`**[${r.id}] ${r.name}**`);
+                lines.push(`   trigger: domain ${r.trigger.domain} | pattern: ${r.trigger.pattern}`);
+                lines.push(`   outcomes: ${outcomeStr}`);
+                lines.push('');
+            }
+        }
+
+        // ── Demotion Candidates ─────────────────────────────────────────────────
+        lines.push(`### Demotion Candidates (${demotable.length})`);
+        if (demotable.length === 0) {
+            lines.push('None — all active rules within acceptable failure rates.');
+        } else {
+            lines.push('Rules with ≥50% failure rate over ≥4 applications. Consider removing to avoid false positives.');
+            lines.push('');
+            for (const r of demotable) {
+                const outs  = r.outcomes!;
+                const total = outs.success + outs.failure;
+                const pct   = Math.round((outs.failure / total) * 100);
+                lines.push(`**[${r.id}] ${r.name}**`);
+                lines.push(`   outcomes: ${outs.success} success / ${outs.failure} failure (${pct}% failure rate)`);
+                lines.push(`   → \`orchestrator_reflect_demote\`  rule_id: "${r.id}"`);
+                lines.push('');
+            }
+        }
+
+        return ok(lines.filter(l => l !== '').join('\n'));
+    },
+);
+
+// ---------------------------------------------------------------------------
+// orchestrator_reflect_promote — approve or reject a pending pattern promotion
+// ---------------------------------------------------------------------------
+// @ts-ignore
+srv.tool(
+    'orchestrator_reflect_promote',
+    'Approve or reject a pending pattern promotion. Approving writes a deterministic policy rule to manifest.yaml — enforced automatically on every matching step (Cable 2). Rejecting discards the promotion with an audit note in the failure catalog.',
+    {
+        config_path:  z.string().describe('Absolute path to orchestrator.yaml'),
+        promotion_id: z.string().describe('Promotion identifier in format "domain::failureType" — copy from orchestrator_reflect output'),
+        approved:     z.boolean().describe('true to create a policy rule; false to discard'),
+        approver:     z.string().describe('Identity of the human approver (name or email — written to the audit trail)'),
+        reason:       z.string().optional().describe('Required when rejecting; optional context note when approving'),
+    },
+    async ({ config_path, promotion_id, approved, approver, reason }) => {
+        if (!approved && !reason) {
+            return ok('reason is required when rejecting a promotion.');
+        }
+
+        let config: OrchestratorConfig;
+        try { config = loadConfig(config_path); }
+        catch (err) { return ok(`Config error: ${err instanceof Error ? err.message : String(err)}`); }
+
+        if (!config.orchestrator.vault) return ok('Vault not configured in orchestrator.yaml.');
+
+        const reflection = await getReflection(config.orchestrator.vault.path).catch(() => undefined);
+        if (!reflection) return ok('Enterprise reflection not available (requires agent-enterprise >= 0.4.0).');
+
+        const pending = await reflection.pendingPromotions().catch(() => []);
+        const entry   = pending.find(p =>
+            `${p.pattern.domain}::${p.pattern.failureType}` === promotion_id,
+        );
+
+        if (!entry) {
+            const available = pending
+                .map(p => `${p.pattern.domain}::${p.pattern.failureType}`)
+                .join(', ');
+            return ok(
+                `Promotion "${promotion_id}" not found in pending list.\n` +
+                (available ? `Available: ${available}` : 'No pending promotions — run orchestrator_reflect first.'),
+            );
+        }
+
+        if (approved) {
+            try {
+                const rule = await reflection.approvePromotion(
+                    entry.pattern as Record<string, unknown>, approver,
+                );
+                return ok([
+                    `### Promotion approved ✓`,
+                    `Rule created: **[${rule.id}] ${rule.name}**`,
+                    `domain: ${entry.pattern.domain} | failureType: ${entry.pattern.failureType}`,
+                    `approver: ${approver}`,
+                    reason ? `note: ${reason}` : '',
+                    '',
+                    `Rule is now active — matching steps will be automatically gated (Cable 2).`,
+                    `Run \`orchestrator_reflect\` to see the updated active rules list.`,
+                ].filter(Boolean).join('\n'));
+            } catch (err) {
+                return ok(`Approval failed: ${err instanceof Error ? err.message : String(err)}`);
+            }
+        } else {
+            try {
+                await reflection.rejectPromotion(
+                    entry.pattern as Record<string, unknown>, approver, reason!,
+                );
+                return ok([
+                    `### Promotion rejected`,
+                    `Pattern: ${promotion_id}`,
+                    `approver: ${approver} | reason: ${reason}`,
+                    '',
+                    `Promotion discarded. Pattern will re-appear if the failure type continues to occur.`,
+                ].join('\n'));
+            } catch (err) {
+                return ok(`Rejection failed: ${err instanceof Error ? err.message : String(err)}`);
+            }
+        }
+    },
+);
+
+// ---------------------------------------------------------------------------
+// orchestrator_reflect_demote — approve demotion of an active policy rule
+// ---------------------------------------------------------------------------
+// @ts-ignore
+srv.tool(
+    'orchestrator_reflect_demote',
+    'Approve demotion of an active policy rule with a high failure rate. Removes it from manifest.yaml with a full audit trail written to the failure catalog. Symmetric with orchestrator_reflect_promote — the rulebook only changes in either direction with explicit human approval.',
+    {
+        config_path: z.string().describe('Absolute path to orchestrator.yaml'),
+        rule_id:     z.string().describe('Rule ID to demote — copy from orchestrator_reflect demotion candidates'),
+        approver:    z.string().describe('Identity of the human approver (name or email)'),
+        reason:      z.string().describe('Reason for demotion — written to the audit trail'),
+    },
+    async ({ config_path, rule_id, approver, reason }) => {
+        let config: OrchestratorConfig;
+        try { config = loadConfig(config_path); }
+        catch (err) { return ok(`Config error: ${err instanceof Error ? err.message : String(err)}`); }
+
+        if (!config.orchestrator.vault) return ok('Vault not configured in orchestrator.yaml.');
+
+        const reflection = await getReflection(config.orchestrator.vault.path).catch(() => undefined);
+        if (!reflection) return ok('Enterprise reflection not available (requires agent-enterprise >= 0.4.0).');
+
+        const activeRules = await reflection.activeRules().catch(() => []);
+        const rule        = activeRules.find(r => r.id === rule_id);
+        if (!rule) {
+            const ids = activeRules.map(r => `${r.id} (${r.name})`).join(', ');
+            return ok(
+                `Rule "${rule_id}" not found in active rules.\n` +
+                (ids ? `Active rules: ${ids}` : 'No active rules.'),
+            );
+        }
+
+        try {
+            const removed = await reflection.approveDemotion(rule_id, approver, reason);
+            if (!removed) {
+                return ok(`Demotion failed — "${rule_id}" could not be removed from manifest.yaml.`);
+            }
+            const outs = (rule as { outcomes?: { success: number; failure: number } }).outcomes;
+            return ok([
+                `### Rule demoted ✓`,
+                `Rule: **[${rule_id}] ${rule.name}**`,
+                `trigger domain: ${rule.trigger.domain}`,
+                outs ? `final outcomes: ${outs.success} success / ${outs.failure} failure` : '',
+                `approver: ${approver} | reason: ${reason}`,
+                '',
+                `Rule removed from manifest.yaml — no longer enforced on new steps.`,
+                `Audit note written to failure catalog.`,
+                `Run \`orchestrator_reflect\` to verify the updated rules list.`,
+            ].filter(Boolean).join('\n'));
+        } catch (err) {
+            return ok(`Demotion failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
     },
 );
 
