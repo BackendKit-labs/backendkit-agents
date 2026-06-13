@@ -29,17 +29,20 @@ Output ONLY valid JSON — no markdown, no explanation:
       "id": "t1",
       "agent_id": "agent-id-from-list",
       "task": "specific, actionable instruction for this specialist",
-      "depends_on": []
+      "depends_on": [],
+      "gate": false,
+      "gate_criteria": []
     }
   ]
 }
 
 Rules:
 - Use only agent IDs from the provided list.
-- depends_on: [] means the sub-task can start immediately.
-- depends_on: ["t1"] means this sub-task waits for t1 to finish.
-- If no agent matches a needed capability, use agent_id="unresolved" and note the gap in the task field.
-- Keep each task description focused and self-contained.`;
+- depends_on: [] means the sub-task can start immediately; ["t1"] waits for t1 to finish.
+- If no agent matches a needed capability, use agent_id="unresolved" and note the gap.
+- Keep each task description focused and self-contained.
+- gate: set to true when a MANDATORY GATES section is present and the step's agent domain matches a governed domain. Always false otherwise.
+- gate_criteria: when gate is true, copy the suggested criteria from the MANDATORY GATES section verbatim and add any task-specific criteria that the human approver should verify.`;
 
 // ── TaskPlanner ───────────────────────────────────────────────────────────────
 
@@ -48,23 +51,41 @@ export class TaskPlanner {
         private readonly callLLM: (system: string, user: string) => Promise<string>,
     ) {}
 
-    async plan(task: string, agents: AgentConfig[], vaultContext?: string): Promise<TaskPlan> {
+    async plan(
+        task:          string,
+        agents:        AgentConfig[],
+        vaultContext?: string,
+        policyContext?: string,
+    ): Promise<TaskPlan> {
         const agentList = agents
-            .map(a => `- id: ${a.id}\n  name: ${a.name}\n  capabilities: [${a.capabilities.join(', ')}]`)
+            .map(a => {
+                const lines = [
+                    `- id: ${a.id}`,
+                    `  name: ${a.name}`,
+                    `  capabilities: [${a.capabilities.join(', ')}]`,
+                ];
+                if (a.domain) lines.push(`  domain: ${a.domain}`);
+                return lines.join('\n');
+            })
             .join('\n');
 
         const contextBlock = vaultContext
             ? `\nKnowledge base context (use to inform the plan):\n${vaultContext}\n`
             : '';
 
+        const policyBlock = policyContext
+            ? `\n${policyContext}\n`
+            : '';
+
         const user = [
             `Task: ${task}`,
             contextBlock,
+            policyBlock,
             'Available agents:',
             agentList,
             '',
             'Produce the execution plan as JSON.',
-        ].join('\n');
+        ].filter(Boolean).join('\n');
 
         const raw = await this.callLLM(PLANNER_SYSTEM, user);
         return this.parse(raw);

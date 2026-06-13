@@ -31,7 +31,7 @@ import {
 } from '@backendkit-labs/agent-enterprise';
 import { loadConfig, type OrchestratorConfig } from './config.js';
 import { TaskPlanner }                           from './planner.js';
-import { PlanExecutor, type ExecutionResult }    from './executor.js';
+import { PlanExecutor, type ExecutionResult, type ActiveRule, ruleToGateCriteria } from './executor.js';
 import { OpenAICompatibleProvider, callLLM }     from './provider.js';
 import { RunStore, type RunState }               from './run-store.js';
 import { matchFlow, flowToTaskPlan }             from './static-flow.js';
@@ -134,10 +134,45 @@ async function buildRAG(config: OrchestratorConfig): Promise<{
 
 // ── Planning helpers ──────────────────────────────────────────────────────────
 
+/**
+ * Formats active policyRules into a prompt block injected into the planner.
+ * The LLM uses this to set gate=true and copy the criteria into the generated plan,
+ * making dynamic plans policy-aware from the start (Milestone 3).
+ */
+function buildPolicyContext(rules: ActiveRule[]): string {
+    if (rules.length === 0) return '';
+
+    const byDomain = new Map<string, ActiveRule[]>();
+    for (const r of rules) {
+        const d = r.trigger.domain;
+        if (!byDomain.has(d)) byDomain.set(d, []);
+        byDomain.get(d)!.push(r);
+    }
+
+    const lines = [
+        'MANDATORY GATES — Active policy rules that MUST be reflected in the plan.',
+        'For every step whose agent has a domain matching one below, set gate=true and include the listed gate_criteria.',
+        '',
+    ];
+
+    for (const [domain, domainRules] of byDomain) {
+        lines.push(`Domain: ${domain}`);
+        for (const rule of domainRules) {
+            const criteria = ruleToGateCriteria(rule);
+            lines.push(`  • [${rule.id}] ${rule.name}`);
+            lines.push(`    gate_criteria: ${criteria.map(c => `"${c}"`).join(', ')}`);
+        }
+        lines.push('');
+    }
+
+    return lines.join('\n');
+}
+
 async function planDynamic(
-    config:  OrchestratorConfig,
-    rag:     { search: (q: string) => Promise<string> } | null,
-    task:    string,
+    config:      OrchestratorConfig,
+    rag:         { search: (q: string) => Promise<string> } | null,
+    task:        string,
+    reflection?: ReflectionFull,
 ): Promise<import('./planner.js').TaskPlan & { error?: string }> {
     const orchProvCfg = config.providers[config.orchestrator.provider];
     if (!orchProvCfg) {
@@ -146,8 +181,16 @@ async function planDynamic(
     const orchProvider = new OpenAICompatibleProvider(orchProvCfg);
     const planner      = new TaskPlanner((sys, usr) => callLLM(orchProvider, sys, usr));
     const vaultContext = rag ? await rag.search(task).catch(() => '') : undefined;
+
+    // Milestone 3: inject active policy rules so the LLM generates gates from the start
+    let policyContext: string | undefined;
+    if (reflection) {
+        const rules = await reflection.activeRules().catch(() => []);
+        policyContext = buildPolicyContext(rules) || undefined;
+    }
+
     try {
-        return await planner.plan(task, config.agents, vaultContext);
+        return await planner.plan(task, config.agents, vaultContext, policyContext);
     } catch (err) {
         return { summary: '', subtasks: [], error: `Planning error: ${err instanceof Error ? err.message : String(err)}` };
     }
@@ -291,6 +334,9 @@ srv.tool(
         }
 
         const rag        = await buildRAG(config).catch(() => null);
+        const reflection = config.orchestrator.vault
+            ? await getReflection(config.orchestrator.vault.path).catch(() => undefined)
+            : undefined;
         const configDir  = path.dirname(path.resolve(config_path));
 
         // ── Resolve plan: static flow or dynamic TaskPlanner ─────────────────
@@ -317,12 +363,12 @@ srv.tool(
                 plan       = flowToTaskPlan(matched.flow, payload);
                 planSource = 'static';
             } else {
-                plan       = await planDynamic(config, rag, task);
+                plan       = await planDynamic(config, rag, task, reflection);
                 planSource = 'dynamic';
             }
         // No flows declared → always dynamic
         } else {
-            plan       = await planDynamic(config, rag, task);
+            plan       = await planDynamic(config, rag, task, reflection);
             planSource = 'dynamic';
         }
 

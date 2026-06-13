@@ -299,7 +299,7 @@ export class PlanExecutor {
 
 // ── Rule matching helpers (Cable 2) ───────────────────────────────────────────
 
-type ActiveRule = Awaited<ReturnType<ReflectionAdapter['activeRules']>>[number];
+export type ActiveRule = Awaited<ReturnType<ReflectionAdapter['activeRules']>>[number];
 
 /**
  * Returns true when a policyRule applies to a subtask.
@@ -331,8 +331,9 @@ function matchesSubtask(rule: ActiveRule, taskText: string, agentDomain?: string
 /**
  * Converts a policyRule's `then` action into human-readable gate criteria.
  * These criteria are shown to the approver alongside the agent's output.
+ * Exported so server.ts can inject the same criteria text into the planner prompt.
  */
-function ruleToGateCriteria(rule: ActiveRule): string[] {
+export function ruleToGateCriteria(rule: ActiveRule): string[] {
     const a = rule.then;
     const criteria: string[] = [];
     if ((a.mustInclude as string[] | undefined)?.length)
