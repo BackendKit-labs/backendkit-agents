@@ -1,0 +1,42 @@
+{
+  "name": "@backendkit-labs/workspace-manager",
+  "version": "0.1.0",
+  "description": "Agnóstic workspace manager MCP server — manage curator vaults across any agent",
+  "type": "module",
+  "main": "dist/server.js",
+  "bin": {
+    "workspace-manager": "./dist/server.js"
+  },
+  "files": [
+    "dist/",
+    "AGENT.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BackendKit-labs/backendkit-agents.git",
+    "directory": "packages/workspace-manager"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "build": "tsc --noCheck",
+    "start": "node dist/server.js",
+    "dev": "tsx src/server.ts",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0",
+    "tsx": "^4.7.0"
+  }
+}

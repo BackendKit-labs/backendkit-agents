@@ -60,17 +60,84 @@ export function createRoutes(configManager: ConfigManager): Router {
 
     /**
      * GET /curator/config
-     * Get current configuration
+     * Get current configuration and workspace info
      */
     router.get('/curator/config', (req: Request, res: Response) => {
         try {
             const config = configManager.getConfig();
+            const wsInfo = configManager.getWorkspaceInfo();
             res.json({
                 inputPath: config.inputPath,
                 outputPath: config.outputPath,
                 provider: config.provider,
                 model: config.model,
                 port: config.port,
+                workspace: {
+                    current: wsInfo.current,
+                    available: wsInfo.available.map(w => ({
+                        name: w.name,
+                        description: w.description,
+                    })),
+                },
+            });
+        } catch (err) {
+            res.status(500).json({ error: (err as Error).message });
+        }
+    });
+
+    /**
+     * POST /curator/workspace/:name
+     * Switch to a specific workspace
+     */
+    router.post('/curator/workspace/:name', (req: Request, res: Response) => {
+        try {
+            const workspaceName = req.params.name;
+            const result = configManager.switchWorkspace(workspaceName);
+
+            if (!result.success) {
+                res.status(400).json({
+                    error: 'Workspace switch failed',
+                    message: result.error,
+                });
+                return;
+            }
+
+            const config = configManager.getConfig();
+            res.json({
+                success: true,
+                workspace: workspaceName,
+                config: {
+                    inputPath: config.inputPath,
+                    outputPath: config.outputPath,
+                    provider: config.provider,
+                    model: config.model,
+                },
+            });
+        } catch (err) {
+            res.status(500).json({
+                error: 'Failed to switch workspace',
+                message: (err as Error).message,
+            });
+        }
+    });
+
+    /**
+     * GET /curator/workspaces
+     * List all available workspaces
+     */
+    router.get('/curator/workspaces', (req: Request, res: Response) => {
+        try {
+            const workspaces = configManager.listWorkspaces();
+            const current = configManager.getCurrentWorkspace();
+
+            res.json({
+                current,
+                workspaces: workspaces.map(w => ({
+                    name: w.name,
+                    inputPath: w.inputPath,
+                    outputPath: w.outputPath,
+                    description: w.description,
+                })),
             });
         } catch (err) {
             res.status(500).json({ error: (err as Error).message });
