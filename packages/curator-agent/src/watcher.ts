@@ -105,10 +105,12 @@ async function processInputDirectory(): Promise<void> {
         const filePath = path.join(INPUT_PATH, file);
         const progress = `[${i + 1}/${files.length}]`;
 
-        // Show which file is being processed
-        process.stdout.write(`  ${progress} ${file}... `);
-
         try {
+            // Show which file is being processed with flush
+            const msg = `  ${progress} ${file}... `;
+            process.stdout.write(msg);
+            if (process.stdout.isTTY) process.stdout.write('');
+
             const curator = makeCurator();
             // archiveAfter: false → Keep original files untouched in INPUT_PATH
             await curator.curateFile(filePath, undefined, false);
