@@ -4,42 +4,56 @@
 
 Reads raw documents (technical docs, policies, meeting minutes, regulations) and uses a **reasoning LLM** to extract structured, semantically rich notes — optimized for RAG search by enterprise agents.
 
-## ⚡ Quick Start (2 minutes)
+## ⚡ Quick Start (3 minutes)
 
-### 1. Set Environment Variables
+### 1. Create `.env` File
 
-**PowerShell (Windows):**
-```powershell
-$env:CURATOR_API_KEY = "sk-your-deepseek-key"
-$env:CURATOR_VAULT_PATH = "C:\path\to\your\vault"
-$env:CURATOR_PROVIDER = "deepseek"
-$env:CURATOR_MODEL = "deepseek-reasoner"
-```
-
-**Bash (Linux/Mac):**
 ```bash
-export CURATOR_API_KEY="sk-your-deepseek-key"
-export CURATOR_VAULT_PATH="/path/to/your/vault"
-export CURATOR_PROVIDER="deepseek"
-export CURATOR_MODEL="deepseek-reasoner"
+# Copy the example
+cp .env.example .env
+
+# Edit with your credentials
+# CURATOR_API_KEY=sk-your-key
+# CURATOR_VAULT_PATH=/path/to/vault
 ```
 
-### 2. Run Curator
+### 2. Prepare Vault Structure
 
-Watch a folder and auto-process new documents:
+```bash
+mkdir vault/incoming vault/processed vault/failed
+```
+
+Or copy files to `vault/incoming/`:
+```bash
+cp ../bk-agent/documentation/*.md vault/incoming/
+```
+
+### 3. Run Curator-Agent
+
+**Option A: Using npm script (recommended)**
+```bash
+# Loads .env automatically via dotenv
+npm run watch-vault
+```
+
+**Option B: Direct command**
 ```bash
 npx @backendkit-labs/curator-agent curator-watcher
+# Variables loaded from .env via node -r dotenv/config
 ```
 
-Or process a single file:
+**Option C: Process single file**
 ```bash
-npx @backendkit-labs/curator-agent curator-ingest-file \
-  --file "/path/to/document.md"
+node -r dotenv/config ./dist/watcher.js --file "vault/incoming/my-doc.md"
 ```
 
-### 3. Check Results
+### 4. Check Results
 
-Curated notes appear in vault with semantic metadata ready for agent search.
+Processed files move to:
+- ✅ `vault/processed/` — Successfully curated
+- ❌ `vault/failed/` — Failed (check error logs)
+
+Curated semantic notes appear in your vault, indexed and ready for agent search.
 
 ---
 
@@ -77,7 +91,7 @@ npx @backendkit-labs/curator-agent curator-watcher
 ### Option B: Install Locally
 ```bash
 npm install @backendkit-labs/curator-agent
-npx curator-agent curator-watcher
+npm run watch-vault
 ```
 
 ### Option C: Install Globally
@@ -88,7 +102,39 @@ curator-agent curator-watcher
 
 ---
 
-## Configuration
+## Configuration with .env File
+
+### 1️⃣ Create `.env` File
+
+In the curator-agent directory, create a `.env` file:
+
+```bash
+# Windows PowerShell
+New-Item -Path ".env" -ItemType File
+# or copy from example
+Copy-Item ".env.example" -Destination ".env"
+```
+
+### 2️⃣ Fill in Your Credentials
+
+Edit `.env` with your API key and vault path:
+
+```env
+CURATOR_API_KEY=sk-your-deepseek-key-here
+CURATOR_VAULT_PATH=C:\Users\mairon.cuello\development\workspace-ia\agent-framework-examples\bk-agent-vault
+CURATOR_PROVIDER=deepseek
+CURATOR_MODEL=deepseek-reasoner
+```
+
+### 3️⃣ Run with `.env` Loaded
+
+```bash
+# Uses dotenv to load .env automatically
+npm run watch-vault
+
+# Or directly with npx
+node -r dotenv/config ./dist/watcher.js
+```
 
 ### Required Environment Variables
 
@@ -453,15 +499,60 @@ vault/
 
 ## Troubleshooting
 
+### `.env` File Not Being Loaded
+
+**Problem:** "CURATOR_API_KEY is required"
+
+**Solutions:**
+
+1. **Check .env file exists:**
+   ```bash
+   # Windows
+   Test-Path ".env"
+   
+   # Linux/Mac
+   ls -la .env
+   ```
+
+2. **Verify .env format (no quotes):**
+   ```env
+   # ✅ Correct
+   CURATOR_API_KEY=sk-your-key
+   CURATOR_VAULT_PATH=/path/to/vault
+   
+   # ❌ Wrong (don't add quotes)
+   CURATOR_API_KEY="sk-your-key"
+   CURATOR_VAULT_PATH="/path/to/vault"
+   ```
+
+3. **Use correct npm script:**
+   ```bash
+   # ✅ Correct (loads .env via dotenv)
+   npm run watch-vault
+   
+   # ❌ Wrong (won't load .env)
+   npx curator-agent curator-watcher
+   ```
+
+4. **Or use node -r dotenv:**
+   ```bash
+   # Direct command that loads .env
+   node -r dotenv/config ./dist/watcher.js
+   ```
+
 ### API Key Issues
 
 ```bash
-# Error: CURATOR_API_KEY is required
-export CURATOR_API_KEY="sk-your-key"
+# Error: Invalid API key
+# 1. Check key is correct in .env
+cat .env | grep CURATOR_API_KEY
 
-# Verify it's set
-echo $CURATOR_API_KEY  # Bash
-echo $env:CURATOR_API_KEY  # PowerShell
+# 2. Make sure no trailing spaces
+# 3. Verify it starts with 'sk-'
+
+# 4. Test with curl
+curl -H "Authorization: Bearer sk-your-key" \
+  https://api.deepseek.com/v1/models
 ```
 
 **Get your key:**
