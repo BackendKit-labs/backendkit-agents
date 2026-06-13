@@ -40,6 +40,14 @@ import * as http     from 'node:http';
 import { KnowledgeCurator } from './curator.js';
 import { createProvider }   from './providers/index.js';
 import { AnimationManager, AnimationType } from '@backendkit-labs/console-animations';
+import {
+    loadManifest,
+    saveManifest,
+    createManifest,
+    hasFileChanged,
+    updateManifestEntry,
+    generateReport,
+} from './checksum.js';
 import type { CurationResult } from './types.js';
 
 // ── Config ─────────────────────────────────────────────────────────────────────
@@ -91,7 +99,7 @@ async function processInputDirectory(): Promise<void> {
     let files: string[];
     try {
         const entries = await fs.readdir(INPUT_PATH);
-        files = entries.filter(f => f.endsWith('.md') || f.endsWith('.txt')).sort();
+        files = entries.filter(f => (f.endsWith('.md') || f.endsWith('.txt')) && !f.startsWith('.')).sort();
     } catch (err) {
         log(`✗ Failed to read INPUT_PATH: ${(err as Error).message}`);
         return;
@@ -102,10 +110,17 @@ async function processInputDirectory(): Promise<void> {
         return;
     }
 
-    console.log(`\n📚 Curing ${files.length} files...\n`);
+    // Load or create manifest
+    let manifest = await loadManifest(INPUT_PATH);
+    if (!manifest) {
+        manifest = createManifest(INPUT_PATH, VAULT_PATH);
+    }
+
+    console.log(`\n📚 Processing ${files.length} files...\n`);
 
     let succeeded = 0;
     let failed = 0;
+    let skipped = 0;
 
     for (let i = 0; i < files.length; i++) {
         const file = files[i];
@@ -114,24 +129,39 @@ async function processInputDirectory(): Promise<void> {
         const progressBar = buildProgressBar(i + 1, files.length);
 
         try {
-            // Show progress: counter, bar, and filename
-            process.stdout.write(`  ${counter} ${progressBar} ${file}... `);
+            // Check if file changed since last curation
+            const changed = await hasFileChanged(filePath, manifest);
 
-            const curator = makeCurator();
-            // archiveAfter: false → Keep original files untouched in INPUT_PATH
-            await curator.curateFile(filePath, undefined, false);
-            succeeded++;
-            console.log('✓');
+            if (!changed) {
+                console.log(`  ${counter} ${progressBar} ${file}... ⊘ (unchanged)`);
+                await updateManifestEntry(manifest, filePath, 'skipped');
+                skipped++;
+            } else {
+                // Show progress: counter, bar, and filename
+                process.stdout.write(`  ${counter} ${progressBar} ${file}... `);
+
+                const curator = makeCurator();
+                // archiveAfter: false → Keep original files untouched in INPUT_PATH
+                await curator.curateFile(filePath, undefined, false);
+                succeeded++;
+                await updateManifestEntry(manifest, filePath, 'success');
+                console.log('✓');
+            }
         } catch (err) {
             console.log(`✗ ${(err as Error).message}`);
             failed++;
+            await updateManifestEntry(manifest, filePath, 'failed');
         }
 
         // Separator line between progress bars
         console.log('');
     }
 
-    console.log(`\n✨ Curation complete: ${succeeded} succeeded, ${failed} failed\n`);
+    // Save manifest
+    await saveManifest(INPUT_PATH, manifest);
+
+    // Print report
+    console.log(generateReport(manifest));
 }
 
 // ── File watcher (poll-based, works reliably on Windows) ─────────────────────
