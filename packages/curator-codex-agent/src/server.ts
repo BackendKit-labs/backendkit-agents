@@ -198,57 +198,6 @@ function createMcpServer(knowledgeEngine: KnowledgeEngine): McpServer {
         },
     );
 
-    // curator_workspace_list
-    t(
-        'curator_workspace_list',
-        'List all available workspaces configured in curator-workspace.json',
-        {},
-        async () => {
-            try {
-                const bkAgentDir = process.env.BK_AGENT_DIR ||
-                    path.join(process.env.HOME || process.env.USERPROFILE || '', '.bk-agent');
-                const wsPath = path.join(bkAgentDir, 'curator-workspace.json');
-
-                if (!fs.existsSync) {
-                    return {
-                        content: [{
-                            type: 'text' as const,
-                            text: JSON.stringify({
-                                error: 'Workspaces file not found',
-                                path: wsPath,
-                            }),
-                        }]
-                    };
-                }
-
-                const content = await fs.readFile(wsPath, 'utf-8');
-                const wsConfig = JSON.parse(content);
-
-                return {
-                    content: [{
-                        type: 'text' as const,
-                        text: JSON.stringify({
-                            current: wsConfig.lastUsed,
-                            workspaces: wsConfig.workspaces.map((w: any) => ({
-                                name: w.name,
-                                inputPath: w.inputPath,
-                                outputPath: w.outputPath,
-                                description: w.description,
-                            })),
-                        }),
-                    }]
-                };
-            } catch (err) {
-                return {
-                    content: [{
-                        type: 'text' as const,
-                        text: JSON.stringify({ error: (err as Error).message }),
-                    }]
-                };
-            }
-        },
-    );
-
     // ── Knowledge Engine Tools ─────────────────────────────────────────────
 
     // knowledge_search
