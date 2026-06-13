@@ -1,0 +1,15 @@
+export { CodeAnalyzer } from './analyzer.js';
+export { DocumentationCurator } from './documentation-curator.js';
+export type { CodeAnalysisNote, CodeAnalysisResult, FileAnalysisContext, AssociatedDocs } from './types.js';
+export { createProvider } from './providers/index.js';
+export type { CuratorLLMProvider } from './providers/types.js';
+export { OpenAIAdapter, AnthropicAdapter } from './providers/index.js';
+export { CuratorHttpServer } from './api/http-server.js';
+export { ConfigManager } from './api/config.js';
+export type { ApiConfig } from './api/config.js';
+export { CuratorRagProvider } from './knowledge/rag-provider.js';
+export type { RagSearchResult, RagSearchOptions } from './knowledge/rag-provider.js';
+export { KnowledgeSynthesizer } from './knowledge/synthesis.js';
+export type { SynthesizedNote } from './knowledge/synthesis.js';
+export { KnowledgeEngine } from './knowledge/engine.js';
+export type { SearchResponse, ReloadResponse } from './knowledge/engine.js';

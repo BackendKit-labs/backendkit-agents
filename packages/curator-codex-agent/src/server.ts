@@ -1,0 +1,392 @@
+#!/usr/bin/env node
+/**
+ * curator-codex-agent — Unified MCP Server (Stdio + HTTP)
+ *
+ * Dual-transport MCP server for maximum flexibility:
+ *   - Stdio Transport (always active) — for Claude Desktop, local agents
+ *   - HTTP Transport (optional)        — for remote clients
+ *
+ * Both transports can run simultaneously, allowing:
+ *   ✓ Claude Desktop (stdio) + remote clients (HTTP)
+ *   ✓ bk-agent embedding (stdio) + external tools (HTTP)
+ *
+ * Required env vars:
+ *   CURATOR_API_KEY      — LLM API key
+ *   CURATOR_OUTPUT_PATH  — vault path
+ *
+ * Optional:
+ *   CURATOR_HTTP_PORT    — Enable HTTP transport on this port (e.g., 3101)
+ *   CURATOR_MODEL        — LLM model (default: deepseek-reasoner)
+ *   CURATOR_BASE_URL     — Custom LLM base URL
+ *
+ * Usage:
+ *   # Stdio only (default, for Claude Desktop)
+ *   npm start
+ *
+ *   # Stdio + HTTP (for maximum flexibility)
+ *   CURATOR_HTTP_PORT=3101 npm start
+ *
+ *   # Stdio + HTTP + verbose logging
+ *   DEBUG=* CURATOR_HTTP_PORT=3101 npm start
+ */
+
+import 'dotenv/config';
+import * as http from 'node:http';
+import * as path from 'node:path';
+import * as fs   from 'node:fs/promises';
+
+import { McpServer }                     from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StdioServerTransport }          from '@modelcontextprotocol/sdk/server/stdio.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { z }                             from 'zod';
+import { CodeAnalyzer }                  from './analyzer.js';
+import { KnowledgeEngine }               from './knowledge/engine.js';
+import { createProvider }                from './providers/index.js';
+import { findAllFiles }                  from './checksum.js';
+
+// ── Configuration ────────────────────────────────────────────────────────────
+
+const API_KEY      = process.env.CURATOR_API_KEY ?? '';
+const VAULT_PATH   = process.env.CURATOR_OUTPUT_PATH ?? '';
+const HTTP_PORT    = process.env.CURATOR_HTTP_PORT ? parseInt(process.env.CURATOR_HTTP_PORT) : null;
+const ENABLE_HTTP   = HTTP_PORT !== null;
+
+let knowledgeEngine: KnowledgeEngine;
+
+if (!API_KEY)    { console.error('[codex] ✗ CURATOR_API_KEY is required'); process.exit(1); }
+if (!VAULT_PATH) { console.error('[codex] ✗ CURATOR_OUTPUT_PATH is required'); process.exit(1); }
+
+function log(msg: string): void {
+    console.error(`[codex] ${msg}`);
+}
+
+function makeAnalyzer(): CodeAnalyzer {
+    return new CodeAnalyzer({ provider: createProvider(), vaultPath: VAULT_PATH });
+}
+
+// ── MCP Server Factory ───────────────────────────────────────────────────────
+//
+// Creates a fresh MCP server with all tools registered.
+// Called once for stdio, once per HTTP request (stateless).
+
+function createMcpServer(knowledgeEngine: KnowledgeEngine): McpServer {
+    const srv = new McpServer({ name: 'curator-codex-agent', version: '0.2.0' });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const t = srv.tool.bind(srv) as any;
+
+    // curator_process_file
+    t(
+        'curator_process_file',
+        'Analyze a single code or documentation file and extract knowledge into the vault. ' +
+        'Supports: TypeScript, JavaScript, Python, Go, Rust, Java, Markdown, Text. ' +
+        'Auto-detects file type and processes accordingly.',
+        {
+            file_path: z.string().describe('Absolute path to the file (.ts, .js, .py, .md, .txt, etc)'),
+            relative_path: z.string().optional().describe('Relative path for vault tracking'),
+        },
+        async ({ file_path, relative_path }: { file_path: string; relative_path?: string }) => {
+            try {
+                const analyzer = makeAnalyzer();
+                const rel = relative_path || path.basename(file_path);
+                const result = await analyzer.analyzeFile(file_path, rel);
+                return {
+                    content: [{
+                        type: 'text' as const,
+                        text: JSON.stringify(result),
+                    }]
+                };
+            } catch (err) {
+                return {
+                    content: [{
+                        type: 'text' as const,
+                        text: JSON.stringify({
+                            notesWritten: [],
+                            notesSkipped: [],
+                            errors: [(err as Error).message],
+                            durationMs: 0,
+                        }),
+                    }]
+                };
+            }
+        },
+    );
+
+    // curator_process_directory
+    t(
+        'curator_process_directory',
+        'Recursively analyze all code and documentation files in a directory. ' +
+        'Intelligently discovers associated documentation (.md files) and combines them with code analysis. ' +
+        'Uses manifest tracking to skip unchanged files on subsequent runs.',
+        {
+            directory_path: z.string().describe('Absolute path to the directory'),
+        },
+        async ({ directory_path }: { directory_path: string }) => {
+            const start = Date.now();
+            const result = {
+                notesWritten: [] as string[],
+                notesSkipped: [] as string[],
+                errors: [] as string[],
+                filesAnalyzed: [] as string[],
+                totalFiles: 0,
+                codeFiles: 0,
+                docFiles: 0,
+                durationMs: 0,
+            };
+
+            try {
+                const files = await findAllFiles(directory_path);
+                if (files.length === 0) {
+                    result.errors.push('No code or documentation files found');
+                    result.durationMs = Date.now() - start;
+                    return { content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
+                }
+
+                result.totalFiles = files.length;
+                result.codeFiles = files.filter(f => f.relativePath.match(/\.(ts|tsx|js|jsx|py|go|rs|java|c|cpp|kt|swift)$/)).length;
+                result.docFiles = files.filter(f => f.relativePath.match(/\.(md|txt)$/)).length;
+
+                const analyzer = makeAnalyzer();
+                for (const file of files) {
+                    try {
+                        const analyzed = await analyzer.analyzeFile(file.fullPath, file.relativePath, files);
+                        result.notesWritten.push(...analyzed.notesWritten);
+                        result.notesSkipped.push(...analyzed.notesSkipped);
+                        result.errors.push(...analyzed.errors);
+                        result.filesAnalyzed.push(...(analyzed.filesAnalyzed || []));
+                    } catch (err) {
+                        result.errors.push(`${file.relativePath}: ${(err as Error).message}`);
+                    }
+                }
+            } catch (err) {
+                result.errors.push(`Failed to read directory: ${(err as Error).message}`);
+            }
+
+            result.durationMs = Date.now() - start;
+            return { content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
+        },
+    );
+
+    // curator_vault_status
+    t(
+        'curator_vault_status',
+        'Get information about the vault and indexing status.',
+        {},
+        async () => {
+            try {
+                const entries = await fs.readdir(VAULT_PATH, { withFileTypes: true });
+                const dirs = entries.filter(e => e.isDirectory()).length;
+                const files = entries.filter(e => e.isFile()).length;
+                return {
+                    content: [{
+                        type: 'text' as const,
+                        text: JSON.stringify({
+                            vaultPath: VAULT_PATH,
+                            subdirectories: dirs,
+                            rootFiles: files,
+                            status: 'ready',
+                        }),
+                    }]
+                };
+            } catch (err) {
+                return {
+                    content: [{
+                        type: 'text' as const,
+                        text: JSON.stringify({ error: (err as Error).message }),
+                    }]
+                };
+            }
+        },
+    );
+
+    // ── Knowledge Engine Tools ─────────────────────────────────────────────
+
+    // knowledge_search
+    t(
+        'knowledge_search',
+        'Search the vault using semantic search (RAG). Returns relevant notes and optionally generates a synthetic summary.',
+        {
+            query: z.string().describe('Search query (natural language, e.g., "How to handle errors?")'),
+            topK: z.number().optional().describe('Number of results to return (default: 5)'),
+            autoSynthesize: z.boolean().optional().describe('Generate synthesis note (default: true)'),
+        },
+        async ({ query, topK, autoSynthesize }: any) => {
+            try {
+                const response = await knowledgeEngine.search(query, {
+                    topK,
+                    autoSynthesize: autoSynthesize !== false,
+                });
+                return {
+                    content: [{
+                        type: 'text' as const,
+                        text: JSON.stringify(response),
+                    }]
+                };
+            } catch (err) {
+                return {
+                    content: [{
+                        type: 'text' as const,
+                        text: JSON.stringify({ error: (err as Error).message }),
+                    }]
+                };
+            }
+        },
+    );
+
+    // knowledge_reload
+    t(
+        'knowledge_reload',
+        'Reload and reindex the vault. Call this after external changes to the vault files.',
+        {},
+        async () => {
+            try {
+                const response = await knowledgeEngine.reload();
+                return {
+                    content: [{
+                        type: 'text' as const,
+                        text: JSON.stringify(response),
+                    }]
+                };
+            } catch (err) {
+                return {
+                    content: [{
+                        type: 'text' as const,
+                        text: JSON.stringify({ error: (err as Error).message }),
+                    }]
+                };
+            }
+        },
+    );
+
+    // knowledge_stats
+    t(
+        'knowledge_stats',
+        'Get knowledge engine statistics and status.',
+        {},
+        async () => {
+            try {
+                const stats = await knowledgeEngine.getStats();
+                return {
+                    content: [{
+                        type: 'text' as const,
+                        text: JSON.stringify(stats),
+                    }]
+                };
+            } catch (err) {
+                return {
+                    content: [{
+                        type: 'text' as const,
+                        text: JSON.stringify({ error: (err as Error).message }),
+                    }]
+                };
+            }
+        },
+    );
+
+    return srv;
+}
+
+// ── Stdio Transport ──────────────────────────────────────────────────────────
+
+async function startStdio(): Promise<void> {
+    const srv       = createMcpServer(knowledgeEngine);
+    const transport = new StdioServerTransport();
+    await srv.connect(transport);
+    log('✓ Stdio MCP transport ready');
+}
+
+// ── HTTP Transport ──────────────────────────────────────────────────────────
+
+async function startHttp(port: number): Promise<void> {
+    const server = http.createServer(async (req, res) => {
+        if (req.method !== 'POST' || req.url !== '/mcp') {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                error: 'Use POST /mcp',
+                message: 'This is an MCP server. POST JSON-RPC requests to /mcp',
+            }));
+            return;
+        }
+
+        const chunks: Buffer[] = [];
+        for await (const chunk of req) chunks.push(chunk as Buffer);
+        let body: unknown;
+
+        try {
+            body = JSON.parse(Buffer.concat(chunks).toString());
+        } catch {
+            res.writeHead(400).end(JSON.stringify({ error: 'Invalid JSON' }));
+            return;
+        }
+
+        try {
+            const srv       = createMcpServer(knowledgeEngine);
+            const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+            await srv.connect(transport);
+            await transport.handleRequest(req, res, body);
+        } catch (err) {
+            res.writeHead(500).end(JSON.stringify({
+                error: (err as Error).message,
+            }));
+        }
+    });
+
+    await new Promise<void>(resolve => {
+        server.listen(port, () => {
+            log(`✓ HTTP MCP transport on http://localhost:${port}/mcp`);
+            resolve();
+        });
+    });
+}
+
+// ── Main ─────────────────────────────────────────────────────────────────────
+
+async function main(): Promise<void> {
+    console.error('');
+    log('╔════════════════════════════════════════╗');
+    log('║  Curator-Codex Agent — MCP Server      ║');
+    log('╚════════════════════════════════════════╝');
+    log(`Vault:     ${VAULT_PATH}`);
+    log(`Model:     ${process.env.CURATOR_MODEL || 'deepseek-reasoner'}`);
+
+    // Initialize Knowledge Engine
+    try {
+        log('Initializing knowledge engine...');
+        knowledgeEngine = new KnowledgeEngine(createProvider(), VAULT_PATH);
+        await knowledgeEngine.initialize();
+        log('✓ Knowledge engine ready');
+    } catch (err) {
+        log(`⚠ Knowledge engine initialization failed: ${(err as Error).message}`);
+        log('  (Curation will work, RAG search will be unavailable)');
+        // Don't exit, allow curation-only mode
+        knowledgeEngine = new KnowledgeEngine(createProvider(), VAULT_PATH);
+    }
+
+    // Start Stdio (always)
+    try {
+        await startStdio();
+    } catch (err) {
+        log(`✗ Stdio transport failed: ${(err as Error).message}`);
+        process.exit(1);
+    }
+
+    // Start HTTP (optional)
+    if (ENABLE_HTTP) {
+        try {
+            await startHttp(HTTP_PORT!);
+        } catch (err) {
+            log(`✗ HTTP transport failed: ${(err as Error).message}`);
+            process.exit(1);
+        }
+    } else {
+        log('(HTTP transport disabled. Set CURATOR_HTTP_PORT to enable)');
+    }
+
+    console.error('');
+    log('Ready for connections');
+    console.error('');
+}
+
+main().catch(err => {
+    log(`✗ Fatal: ${(err as Error).message}`);
+    process.exit(1);
+});
