@@ -111,46 +111,74 @@ export class PlanExecutor {
                 throw new Error('Circular dependency detected in task plan');
             }
 
-            for (const subtask of ready) {
-                // Resolve explicit gate from subtask or agent config
-                const agentCfg       = this.config.agents.find(a => a.id === subtask.agent_id);
-                const needsGate      = subtask.gate ?? agentCfg?.gate ?? false;
-                const explicitCriteria = subtask.gate_criteria ?? agentCfg?.gate_criteria ?? [];
+            // ── 1. Prepare all ready steps in parallel (rule checks + metadata) ──
+            const preps = await Promise.all(ready.map(async subtask => {
+                const agentCfg          = this.config.agents.find(a => a.id === subtask.agent_id);
+                const needsGateExplicit = subtask.gate ?? agentCfg?.gate ?? false;
+                const explicitCriteria  = subtask.gate_criteria ?? agentCfg?.gate_criteria ?? [];
 
-                // ── Cable 2: check active policyRules before running ───────────
-                // Rules that match this step add criteria to the gate, turning
-                // un-gated steps into gated ones — deterministically, without LLM.
+                // Cable 2: parallel rule check across all ready steps
                 const { matchedRuleIds, ruleCriteria } = await this.checkActiveRules(
                     subtask.task,
                     agentCfg?.domain,
                 );
-                const forceGate  = matchedRuleIds.length > 0;
-                const allCriteria = [...explicitCriteria, ...ruleCriteria];
+                return {
+                    subtask,
+                    needsGate:        needsGateExplicit || matchedRuleIds.length > 0,
+                    explicitCriteria,
+                    matchedRuleIds,
+                    ruleCriteria,
+                };
+            }));
 
-                if (forceGate) {
+            for (const p of preps) {
+                if (p.matchedRuleIds.length > 0) {
                     this.onProgress(
-                        `  ⚠ [${subtask.id}] ${matchedRuleIds.length} policy rule(s) applied — gate enforced`,
+                        `  ⚠ [${p.subtask.id}] ${p.matchedRuleIds.length} policy rule(s) applied — gate enforced`,
                     );
                 }
-                // ─────────────────────────────────────────────────────────────────
+            }
 
-                const result = await this.runSubTask(subtask, results);
+            if (ready.length > 1) {
+                this.onProgress(`  ⚡ [parallel] ${ready.map(s => s.id).join(' + ')}`);
+            }
+
+            // ── 2. Run all ready steps in parallel ────────────────────────────────
+            // Gates check the *output*, not whether the step should run — it is safe
+            // to run all ready steps concurrently and gate on the results.
+            const batchResults = await Promise.all(
+                preps.map(p => this.runSubTask(p.subtask, results)),
+            );
+
+            // ── 3. Collect results; return first gate hit ─────────────────────────
+            // All results are added to `completed` before returning a GateHit so that
+            // `completedSoFar` is accurate and the resume path skips them correctly.
+            // If multiple parallel steps need gates, the second fires on the next resume
+            // cycle (it will then appear alone in `ready`, so its gate is not skipped).
+            let gateHit: GateHit | undefined;
+
+            for (let i = 0; i < preps.length; i++) {
+                const { subtask, needsGate, explicitCriteria, matchedRuleIds, ruleCriteria } = preps[i];
+                const result = batchResults[i];
+
                 results.push(result);
                 completed.add(subtask.id);
                 remaining.splice(remaining.indexOf(subtask), 1);
 
-                if ((needsGate || forceGate) && result.success) {
-                    return {
+                if (!gateHit && needsGate && result.success) {
+                    gateHit = {
                         gateRequired:   true,
                         stepId:         subtask.id,
                         agentId:        subtask.agent_id,
                         output:         result.result,
-                        criteria:       allCriteria,
-                        completedSoFar: results,
+                        criteria:       [...explicitCriteria, ...ruleCriteria],
+                        completedSoFar: [...results],
                         appliedRuleIds: matchedRuleIds,
                     };
                 }
             }
+
+            if (gateHit) return gateHit;
         }
 
         const summary = this.consolidate(plan, results);
