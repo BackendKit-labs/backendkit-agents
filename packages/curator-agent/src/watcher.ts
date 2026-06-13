@@ -39,7 +39,7 @@ import * as path     from 'node:path';
 import * as http     from 'node:http';
 import { KnowledgeCurator } from './curator.js';
 import { createProvider }   from './providers/index.js';
-import { ProgressBar }      from '@backendkit-labs/console-animations';
+import { AnimationManager, AnimationType } from '@backendkit-labs/console-animations';
 import type { CurationResult } from './types.js';
 
 // ── Config ─────────────────────────────────────────────────────────────────────
@@ -95,18 +95,21 @@ async function processInputDirectory(): Promise<void> {
         return;
     }
 
+    const manager = new AnimationManager();
     log(`\n📚 Processing ${files.length} files from ${INPUT_PATH}`);
-    const progress = new ProgressBar({
+
+    const progressId = manager.start({
+        type: AnimationType.PROGRESS_BAR,
+        text: 'Curation Progress',
         total: files.length,
-        width: 50,
-        label: 'Curation Progress'
+        width: 50
     });
 
-    let processed = 0;
     let succeeded = 0;
     let failed = 0;
 
-    for (const file of files) {
+    for (let i = 0; i < files.length; i++) {
+        const file = files[i];
         const filePath = path.join(INPUT_PATH, file);
         try {
             const curator = makeCurator();
@@ -116,12 +119,13 @@ async function processInputDirectory(): Promise<void> {
             log(`  ✗ ${file} — error: ${(err as Error).message}`);
             failed++;
         }
-        processed++;
-        progress.update(processed);
+        // Update progress bar
+        manager.update(progressId, { total: files.length, custom: { current: i + 1 } });
     }
 
-    progress.complete();
-    log(`\n✓ Curation complete: ${succeeded} succeeded, ${failed} failed\n`);
+    manager.succeed(progressId, `✓ Complete: ${succeeded} succeeded, ${failed} failed`);
+    manager.destroy(progressId);
+    log('');
 }
 
 // ── File watcher (poll-based, works reliably on Windows) ─────────────────────
