@@ -95,15 +95,7 @@ async function processInputDirectory(): Promise<void> {
         return;
     }
 
-    const manager = new AnimationManager();
-    log(`\n📚 Processing ${files.length} files from ${INPUT_PATH}`);
-
-    const progressId = manager.start({
-        type: AnimationType.PROGRESS_BAR,
-        text: 'Curation Progress',
-        total: files.length,
-        width: 50
-    });
+    console.log(`\n📚 Curing ${files.length} files...\n`);
 
     let succeeded = 0;
     let failed = 0;
@@ -111,21 +103,23 @@ async function processInputDirectory(): Promise<void> {
     for (let i = 0; i < files.length; i++) {
         const file = files[i];
         const filePath = path.join(INPUT_PATH, file);
+        const progress = `[${i + 1}/${files.length}]`;
+
+        // Show which file is being processed
+        process.stdout.write(`  ${progress} ${file}... `);
+
         try {
             const curator = makeCurator();
             await curator.curateFile(filePath);
             succeeded++;
+            console.log('✓');
         } catch (err) {
-            log(`  ✗ ${file} — error: ${(err as Error).message}`);
+            console.log(`✗ ${(err as Error).message}`);
             failed++;
         }
-        // Update progress bar
-        manager.update(progressId, { total: files.length, custom: { current: i + 1 } });
     }
 
-    manager.succeed(progressId, `✓ Complete: ${succeeded} succeeded, ${failed} failed`);
-    manager.destroy(progressId);
-    log('');
+    console.log(`\n✨ Curation complete: ${succeeded} succeeded, ${failed} failed\n`);
 }
 
 // ── File watcher (poll-based, works reliably on Windows) ─────────────────────
