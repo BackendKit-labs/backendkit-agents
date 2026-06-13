@@ -333,6 +333,257 @@ function createMcpServer(knowledgeEngine: KnowledgeEngine): McpServer {
         },
     );
 
+    // ── Workspace Management ───────────────────────────────────────────────────
+
+    // curator_workspace_list
+    t(
+        'curator_workspace_list',
+        'List all available workspaces and show which one is currently active.',
+        {},
+        async () => {
+            try {
+                const bkAgentDir = process.env.BK_AGENT_DIR ||
+                    path.join(process.env.HOME || process.env.USERPROFILE || '', '.bk-agent');
+                const wsPath = path.join(bkAgentDir, 'curator-workspace.json');
+
+                const content = await fs.readFile(wsPath, 'utf-8');
+                const wsConfig = JSON.parse(content);
+
+                return {
+                    content: [{
+                        type: 'text' as const,
+                        text: JSON.stringify({
+                            current: wsConfig.lastUsed,
+                            workspaces: wsConfig.workspaces.map((w: any) => ({
+                                name: w.name,
+                                inputPath: w.inputPath,
+                                outputPath: w.outputPath,
+                                description: w.description,
+                                active: w.name === wsConfig.lastUsed,
+                            })),
+                        }),
+                    }]
+                };
+            } catch (err) {
+                return {
+                    content: [{
+                        type: 'text' as const,
+                        text: JSON.stringify({ error: `Failed to read workspaces: ${(err as Error).message}` }),
+                    }]
+                };
+            }
+        },
+    );
+
+    // curator_workspace_current
+    t(
+        'curator_workspace_current',
+        'Get details of the currently active workspace.',
+        {},
+        async () => {
+            try {
+                const bkAgentDir = process.env.BK_AGENT_DIR ||
+                    path.join(process.env.HOME || process.env.USERPROFILE || '', '.bk-agent');
+                const wsPath = path.join(bkAgentDir, 'curator-workspace.json');
+
+                const content = await fs.readFile(wsPath, 'utf-8');
+                const wsConfig = JSON.parse(content);
+                const current = wsConfig.workspaces.find((w: any) => w.name === wsConfig.lastUsed);
+
+                if (!current) {
+                    return {
+                        content: [{
+                            type: 'text' as const,
+                            text: JSON.stringify({ error: 'No workspace selected' }),
+                        }]
+                    };
+                }
+
+                return {
+                    content: [{
+                        type: 'text' as const,
+                        text: JSON.stringify({
+                            name: current.name,
+                            workspace: current,
+                        }),
+                    }]
+                };
+            } catch (err) {
+                return {
+                    content: [{
+                        type: 'text' as const,
+                        text: JSON.stringify({ error: (err as Error).message }),
+                    }]
+                };
+            }
+        },
+    );
+
+    // curator_workspace_switch
+    t(
+        'curator_workspace_switch',
+        'Switch to a different workspace. Updates the active workspace globally.',
+        {
+            name: z.string().describe('Workspace name to switch to'),
+        },
+        async ({ name }: { name: string }) => {
+            try {
+                const bkAgentDir = process.env.BK_AGENT_DIR ||
+                    path.join(process.env.HOME || process.env.USERPROFILE || '', '.bk-agent');
+                const wsPath = path.join(bkAgentDir, 'curator-workspace.json');
+
+                const content = await fs.readFile(wsPath, 'utf-8');
+                const wsConfig = JSON.parse(content);
+                const workspace = wsConfig.workspaces.find((w: any) => w.name === name);
+
+                if (!workspace) {
+                    return {
+                        content: [{
+                            type: 'text' as const,
+                            text: JSON.stringify({
+                                success: false,
+                                error: `Workspace "${name}" not found`,
+                                available: wsConfig.workspaces.map((w: any) => w.name),
+                            }),
+                        }]
+                    };
+                }
+
+                wsConfig.lastUsed = name;
+                await fs.writeFile(wsPath, JSON.stringify(wsConfig, null, 2), 'utf-8');
+
+                return {
+                    content: [{
+                        type: 'text' as const,
+                        text: JSON.stringify({
+                            success: true,
+                            workspace: name,
+                            config: {
+                                inputPath: workspace.inputPath,
+                                outputPath: workspace.outputPath,
+                                description: workspace.description,
+                            },
+                            message: `Switched to workspace: ${name}`,
+                        }),
+                    }]
+                };
+            } catch (err) {
+                return {
+                    content: [{
+                        type: 'text' as const,
+                        text: JSON.stringify({ error: (err as Error).message }),
+                    }]
+                };
+            }
+        },
+    );
+
+    // curator_workspace_add
+    t(
+        'curator_workspace_add',
+        'Add a new workspace or update an existing one.',
+        {
+            name: z.string().describe('Workspace name (unique identifier)'),
+            inputPath: z.string().describe('Input directory path for curation'),
+            outputPath: z.string().describe('Output vault path'),
+            description: z.string().optional().describe('Human-readable description'),
+        },
+        async ({ name, inputPath, outputPath, description }: any) => {
+            try {
+                const bkAgentDir = process.env.BK_AGENT_DIR ||
+                    path.join(process.env.HOME || process.env.USERPROFILE || '', '.bk-agent');
+                const wsPath = path.join(bkAgentDir, 'curator-workspace.json');
+
+                const content = await fs.readFile(wsPath, 'utf-8');
+                const wsConfig = JSON.parse(content);
+                const idx = wsConfig.workspaces.findIndex((w: any) => w.name === name);
+
+                if (idx >= 0) {
+                    wsConfig.workspaces[idx] = { name, inputPath, outputPath, description };
+                } else {
+                    wsConfig.workspaces.push({ name, inputPath, outputPath, description });
+                }
+
+                await fs.writeFile(wsPath, JSON.stringify(wsConfig, null, 2), 'utf-8');
+
+                return {
+                    content: [{
+                        type: 'text' as const,
+                        text: JSON.stringify({
+                            success: true,
+                            action: idx >= 0 ? 'updated' : 'created',
+                            workspace: { name, inputPath, outputPath, description },
+                        }),
+                    }]
+                };
+            } catch (err) {
+                return {
+                    content: [{
+                        type: 'text' as const,
+                        text: JSON.stringify({ error: (err as Error).message }),
+                    }]
+                };
+            }
+        },
+    );
+
+    // curator_workspace_remove
+    t(
+        'curator_workspace_remove',
+        'Remove a workspace from the configuration.',
+        {
+            name: z.string().describe('Workspace name to remove'),
+        },
+        async ({ name }: { name: string }) => {
+            try {
+                const bkAgentDir = process.env.BK_AGENT_DIR ||
+                    path.join(process.env.HOME || process.env.USERPROFILE || '', '.bk-agent');
+                const wsPath = path.join(bkAgentDir, 'curator-workspace.json');
+
+                const content = await fs.readFile(wsPath, 'utf-8');
+                const wsConfig = JSON.parse(content);
+                const idx = wsConfig.workspaces.findIndex((w: any) => w.name === name);
+
+                if (idx < 0) {
+                    return {
+                        content: [{
+                            type: 'text' as const,
+                            text: JSON.stringify({
+                                success: false,
+                                error: `Workspace "${name}" not found`,
+                            }),
+                        }]
+                    };
+                }
+
+                wsConfig.workspaces.splice(idx, 1);
+                if (wsConfig.lastUsed === name) {
+                    wsConfig.lastUsed = wsConfig.workspaces[0]?.name || '';
+                }
+
+                await fs.writeFile(wsPath, JSON.stringify(wsConfig, null, 2), 'utf-8');
+
+                return {
+                    content: [{
+                        type: 'text' as const,
+                        text: JSON.stringify({
+                            success: true,
+                            removed: name,
+                            remaining: wsConfig.workspaces.map((w: any) => w.name),
+                        }),
+                    }]
+                };
+            } catch (err) {
+                return {
+                    content: [{
+                        type: 'text' as const,
+                        text: JSON.stringify({ error: (err as Error).message }),
+                    }]
+                };
+            }
+        },
+    );
+
     return srv;
 }
 
