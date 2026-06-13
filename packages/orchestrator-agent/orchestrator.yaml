@@ -1,0 +1,86 @@
+version: 1
+
+orchestrator:
+  name: "Orquestador BK"
+  provider: deepseek
+  vault:
+    path: "C:/Users/mairon.cuello/mairon/Obsidian Vault"
+    embedder: simple     # cambiar a 'ollama' cuando Ollama esté corriendo
+
+# Flows estáticos — detectados automáticamente por trigger
+flows:
+  - id: onboarding-empleado
+    file: ./flows/onboarding-empleado.yaml
+    trigger: "onboarding|nuevo empleado|alta de personal|incorporación"
+
+providers:
+  deepseek:
+    base_url: "https://api.deepseek.com/v1"
+    api_key: "${DEEPSEEK_API_KEY}"
+    model: "deepseek-chat"
+
+  local:
+    base_url: "http://localhost:11434/v1"
+    api_key: "ollama"
+    model: "qwen2.5:14b"    # ajustar al modelo instalado
+
+agents:
+  - id: hr-agent
+    name: "Agente RRHH"
+    description: "Gestiona incorporación de empleados, documentación y checklist de onboarding"
+    capabilities: [onboarding, rrhh, documentacion, checklist, legajo]
+    provider: local           # datos personales → LLM local siempre
+    domain: rrhh
+    gate: true
+    gate_criteria:
+      - "Los datos del empleado están completos y son correctos"
+      - "El checklist de documentación requerida es apropiado para el puesto"
+      - "Las fechas de incorporación están confirmadas"
+
+  - id: it-agent
+    name: "Agente IT"
+    description: "Provisiona accesos, cuentas, credenciales y equipamiento tecnológico"
+    capabilities: [accesos, cuentas, equipamiento, it, sistemas]
+    provider: local           # credenciales e inventario → LLM local
+    domain: operaciones
+
+  - id: legal-agent
+    name: "Agente Legal"
+    description: "Revisa contratos, cláusulas, cumplimiento normativo y política salarial"
+    capabilities: [contratos, legal, compliance, normativa, salarios]
+    provider: local           # documentos legales → LLM local
+    domain: legal
+    gate: true
+    gate_criteria:
+      - "El contrato cumple con la normativa laboral vigente"
+      - "Las cláusulas de confidencialidad son adecuadas para el puesto"
+      - "La remuneración está dentro de la política salarial"
+      - "No hay cláusulas irregulares o riesgosas"
+
+  - id: writer-agent
+    name: "Agente Redactor"
+    description: "Consolida resultados y genera informes, cartas y comunicaciones"
+    capabilities: [redaccion, informes, comunicaciones, resumen, bienvenida]
+    provider: deepseek        # redacción sin datos sensibles → cloud por calidad
+    domain: operaciones
+
+  - id: architect-agent
+    name: "Agente Arquitecto"
+    description: "Analiza arquitectura de sistemas, decisiones técnicas e impacto de cambios"
+    capabilities: [arquitectura, sistemas, impacto, diseno-tecnico, migracion]
+    provider: deepseek
+    domain: operaciones
+
+  - id: data-analyst-agent
+    name: "Agente Analista"
+    description: "Analiza datos, métricas, genera reportes e insights de negocio"
+    capabilities: [datos, metricas, analisis, reporting, kpis]
+    provider: deepseek
+    domain: finanzas
+
+  - id: risk-agent
+    name: "Agente de Riesgos"
+    description: "Identifica y evalúa riesgos técnicos, operacionales y de negocio"
+    capabilities: [riesgos, evaluacion, mitigacion, contingencia, impacto]
+    provider: deepseek
+    domain: operaciones

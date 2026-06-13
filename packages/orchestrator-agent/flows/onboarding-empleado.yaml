@@ -1,0 +1,84 @@
+version: 1
+id: onboarding-empleado
+name: "Onboarding de {{payload.nombre}}"
+description: "Proceso completo de incorporación de un nuevo empleado a la empresa"
+
+steps:
+  # ── Paso 1: RRHH prepara el expediente ────────────────────────────────────
+  - id: s1-hr-checklist
+    agent: hr-agent
+    task: >
+      Preparar el expediente de onboarding para el nuevo empleado con los siguientes datos:
+      - Nombre completo: {{payload.nombre}}
+      - Puesto: {{payload.puesto}}
+      - Área: {{payload.area}}
+      - Fecha de ingreso: {{payload.fecha_ingreso}}
+      - Modalidad: {{payload.modalidad}}
+
+      Generar el checklist completo de documentación requerida, verificar que todos los datos
+      estén completos y preparar el resumen del proceso para la aprobación.
+    depends_on: []
+    gate: true
+    gate_criteria:
+      - "Los datos del empleado están completos y son correctos"
+      - "El checklist de documentación requerida es apropiado para el puesto"
+      - "La fecha de ingreso y modalidad están confirmadas"
+
+  # ── Paso 2a: IT provisiona accesos (en paralelo con legal) ────────────────
+  - id: s2-it-accesos
+    agent: it-agent
+    task: >
+      Provisionar accesos y equipamiento para {{payload.nombre}} que ingresa como {{payload.puesto}}
+      en el área {{payload.area}} el {{payload.fecha_ingreso}} en modalidad {{payload.modalidad}}.
+
+      Crear y documentar:
+      1. Cuenta de email corporativo
+      2. Acceso a VPN (si corresponde por modalidad)
+      3. Permisos en sistemas según el puesto
+      4. Equipamiento asignado o instrucciones para retiro
+      5. Credenciales de acceso a las herramientas del área
+
+      Generar el resumen de accesos creados para incluir en el legajo.
+    depends_on: [s1-hr-checklist]
+
+  # ── Paso 2b: Legal revisa el contrato (en paralelo con IT) ────────────────
+  - id: s3-legal-contrato
+    agent: legal-agent
+    task: >
+      Revisar y validar el contrato de trabajo para:
+      - Nombre: {{payload.nombre}}
+      - Puesto: {{payload.puesto}}
+      - Área: {{payload.area}}
+      - Fecha de ingreso: {{payload.fecha_ingreso}}
+      - Modalidad: {{payload.modalidad}}
+      - Remuneración pactada: {{payload.remuneracion}}
+
+      Verificar que el contrato cumple con la normativa laboral vigente, que las cláusulas
+      de confidencialidad y no competencia son apropiadas para el puesto, y que la
+      remuneración está dentro de la política salarial de la empresa.
+    depends_on: [s1-hr-checklist]
+    gate: true
+    gate_criteria:
+      - "El contrato cumple con la normativa laboral vigente"
+      - "Las cláusulas de confidencialidad son adecuadas para el puesto"
+      - "La remuneración está dentro de la política salarial"
+      - "No hay cláusulas irregulares o riesgosas para la empresa"
+
+  # ── Paso 3: Redactor consolida y genera comunicaciones ────────────────────
+  - id: s4-bienvenida
+    agent: writer-agent
+    task: >
+      Consolidar el proceso de onboarding de {{payload.nombre}} y generar los documentos finales:
+
+      1. Carta de bienvenida personalizada para {{payload.nombre}}
+         (tono cálido y profesional, incluyendo información del área {{payload.area}}
+         y el primer día en la empresa el {{payload.fecha_ingreso}})
+
+      2. Resumen ejecutivo del proceso de onboarding completado:
+         - Expediente RRHH: ✓
+         - Accesos IT: ✓ (incorporar resumen del paso anterior)
+         - Contrato legal: ✓ aprobado
+         - Estado general: COMPLETO
+
+      3. Checklist de acciones pendientes para el primer día
+    depends_on: [s2-it-accesos, s3-legal-contrato]

@@ -1,17 +1,17 @@
 import * as fs   from 'node:fs/promises';
 import * as path from 'node:path';
-import OpenAI    from 'openai';
 import {
     CuratedNote,
     CurationResponse,
     CurationResponseSchema,
     CurationResult,
 } from './types.js';
+import type { CuratorLLMProvider } from './providers/types.js';
 
 // ── System prompt ─────────────────────────────────────────────────────────────
 //
 // Strict JSON-only output with Zod-validated schema.
-// Low temperature (0.2) for consistent structure.
+// Temperature 0.2 for non-reasoning models; reasoning models ignore it.
 // Max 5 notes per document — forces the LLM to prioritise.
 
 const SYSTEM_PROMPT = `\
@@ -92,31 +92,22 @@ function buildFrontmatter(note: CuratedNote, source: string, date: string): stri
 // ── KnowledgeCurator ──────────────────────────────────────────────────────────
 
 export interface CuratorOptions {
-    /** DeepSeek / OpenAI-compatible API key. */
-    apiKey: string;
+    /** LLM provider to use for extraction. Use createProvider() from ./providers/index.ts. */
+    provider: CuratorLLMProvider;
     /** Absolute path to the shared vault root. */
     vaultPath: string;
-    /** Model to use. Default: deepseek-chat */
-    model?: string;
-    /** Base URL. Default: DeepSeek API. Use http://localhost:11434/v1 for Ollama. */
-    baseUrl?: string;
     /** Max chars of document text to send to LLM (safety cap). Default: 12 000 */
     maxInputChars?: number;
 }
 
 export class KnowledgeCurator {
-    private readonly client: OpenAI;
+    private readonly provider: CuratorLLMProvider;
     private readonly vaultPath: string;
-    private readonly model: string;
     private readonly maxInputChars: number;
 
     constructor(opts: CuratorOptions) {
-        this.client = new OpenAI({
-            apiKey:  opts.apiKey,
-            baseURL: opts.baseUrl ?? 'https://api.deepseek.com',
-        });
-        this.vaultPath    = opts.vaultPath;
-        this.model        = opts.model        ?? 'deepseek-chat';
+        this.provider      = opts.provider;
+        this.vaultPath     = opts.vaultPath;
         this.maxInputChars = opts.maxInputChars ?? 12_000;
     }
 
@@ -124,19 +115,19 @@ export class KnowledgeCurator {
 
     /**
      * Curate raw text. Calls the LLM, validates the response, writes vault notes.
-     * Returns a summary of what was written, skipped, or failed.
+     *
+     * @param areaHint  Optional hint for the primary area ("rrhh", "legal", …).
+     *                  Passed to the LLM as context — does not override its judgement.
      */
-    async curateText(text: string, source: string): Promise<CurationResult> {
+    async curateText(text: string, source: string, areaHint?: string): Promise<CurationResult> {
         const start  = Date.now();
         const result: CurationResult = {
             notesWritten: [], notesSkipped: [], errors: [], durationMs: 0,
         };
 
-        // ── 1. LLM call ────────────────────────────────────────────────────────
-
         let parsed: CurationResponse;
         try {
-            parsed = await this.callLLM(text, source);
+            parsed = await this.callLLM(text, source, areaHint);
         } catch (err) {
             result.errors.push(`LLM call failed: ${(err as Error).message}`);
             result.durationMs = Date.now() - start;
@@ -148,8 +139,6 @@ export class KnowledgeCurator {
             result.durationMs = Date.now() - start;
             return result;
         }
-
-        // ── 2. Write each note ─────────────────────────────────────────────────
 
         const date = new Date().toISOString().slice(0, 10);
 
@@ -174,7 +163,7 @@ export class KnowledgeCurator {
      * Curate a file on disk.
      * After processing, moves it to vault/processed/ (or vault/failed/ on error).
      */
-    async curateFile(filePath: string): Promise<CurationResult> {
+    async curateFile(filePath: string, areaHint?: string): Promise<CurationResult> {
         let text: string;
         try {
             text = await fs.readFile(filePath, 'utf-8');
@@ -187,7 +176,7 @@ export class KnowledgeCurator {
         }
 
         const source = path.basename(filePath);
-        const result = await this.curateText(text, source);
+        const result = await this.curateText(text, source, areaHint);
 
         await this.archiveFile(filePath, result.errors.length > 0 && !result.notesWritten.length);
         return result;
@@ -195,24 +184,35 @@ export class KnowledgeCurator {
 
     // ── Private ────────────────────────────────────────────────────────────────
 
-    private async callLLM(text: string, source: string): Promise<CurationResponse> {
+    private async callLLM(text: string, source: string, areaHint?: string): Promise<CurationResponse> {
         const truncated = text.slice(0, this.maxInputChars);
-        const userMsg   = `Source: ${source}\n\nDocument:\n${truncated}`;
+        const hintLine  = areaHint ? `\nArea hint: this document is primarily about "${areaHint}".` : '';
+        const userMsg   = `Source: ${source}${hintLine}\n\nDocument:\n${truncated}`;
 
-        const completion = await this.client.chat.completions.create({
-            model:           this.model,
-            temperature:     0.2,
-            response_format: { type: 'json_object' },
-            messages: [
-                { role: 'system', content: SYSTEM_PROMPT },
-                { role: 'user',   content: userMsg },
-            ],
-        });
+        const raw = await this.provider.complete(SYSTEM_PROMPT, userMsg);
 
-        const raw = completion.choices[0]?.message?.content ?? '{}';
+        // Extract JSON even if the model wrapped it in markdown code fences
+        const jsonStr = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
 
-        // Validate with Zod — throws ZodError on bad shape
-        return CurationResponseSchema.parse(JSON.parse(raw));
+        // Sanitize: replace JS `undefined` literals (invalid JSON) with null
+        const sanitized = jsonStr.replace(/:\s*undefined/g, ': null');
+        const parsed    = JSON.parse(sanitized);
+
+        // Normalize notes before Zod validation
+        if (Array.isArray(parsed?.notes)) {
+            for (const note of parsed.notes) {
+                // Truncate resumen if LLM exceeded the limit
+                if (typeof note.resumen === 'string' && note.resumen.length > 500) {
+                    note.resumen = note.resumen.slice(0, 497) + '…';
+                }
+                // Drop null optional fields (Zod optional expects undefined, not null)
+                for (const key of ['vigente_desde', 'version', 'expires_at', 'decidido_por', 'aplica_a']) {
+                    if (note[key] === null) delete note[key];
+                }
+            }
+        }
+
+        return CurationResponseSchema.parse(parsed);
     }
 
     private async writeNote(note: CuratedNote, source: string, date: string): Promise<string | null> {
@@ -221,10 +221,9 @@ export class KnowledgeCurator {
         const filename = `${date}-${slug}.md`;
         const filePath = path.join(dir, filename);
 
-        // Dedup: skip if a file with the same slug already exists
         try {
             await fs.access(filePath);
-            return null; // already exists
+            return null; // already exists — dedup
         } catch {
             // doesn't exist — proceed
         }

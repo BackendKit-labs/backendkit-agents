@@ -31,7 +31,7 @@ export const CuratedNoteSchema = z.object({
      * 1-2 sentences dense with searchable terms: names, numbers, rules, dates.
      * This is the primary field used by semantic search — write it carefully.
      */
-    resumen: z.string().min(10).max(300),
+    resumen: z.string().min(10).max(500),
     /** Markdown body with ## sections. Extracted facts, not raw copy-paste. */
     content: z.string().min(20),
     /** Hierarchical tags: "área/<area>", "tipo/<type>", "estado/vigente", etc. */

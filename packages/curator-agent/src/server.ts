@@ -1,27 +1,31 @@
 #!/usr/bin/env node
 /**
- * curator-agent — MCP stdio server
+ * curator-agent — MCP server
  *
- * Exposes the KnowledgeCurator as MCP tools so any agent (Claude Code,
- * enterprise agents, etc.) can call curator_ingest_text / curator_ingest_file
- * to inject structured knowledge into the vault.
+ * Transports:
+ *   stdio (default)       — Claude Desktop, local agents via child_process
+ *   HTTP  (CURATOR_PORT)  — vault-manager, knowledge-agent, remote agents
  *
  * Required env vars:
- *   CURATOR_API_KEY    — DeepSeek / OpenAI-compatible API key
- *   CURATOR_VAULT_PATH — absolute path to the shared vault
+ *   CURATOR_API_KEY    — provider API key
+ *   CURATOR_VAULT_PATH — absolute path to the vault
  *
  * Optional:
- *   CURATOR_MODEL      — LLM model (default: deepseek-chat)
- *   CURATOR_BASE_URL   — LLM base URL (default: DeepSeek API)
+ *   CURATOR_PORT         — HTTP port (e.g. 3100). If set, serves HTTP MCP.
+ *   CURATOR_MODEL        — orchestration model (default: deepseek-chat)
+ *   CURATOR_RESEARCH_MODEL — article generation model (default: deepseek-chat)
+ *   CURATOR_BASE_URL     — custom LLM base URL
+ *   VAULT_MANAGER_URL    — vault-manager base URL for auto-sync
+ *   VAULT_MANAGER_ID     — vault definition ID in vault-manager DB
  *
- * Usage in claude_desktop_config.json:
+ * Claude Desktop config:
  *   {
  *     "mcpServers": {
  *       "curator": {
  *         "command": "npx",
  *         "args": ["-y", "@backendkit-labs/curator-agent"],
  *         "env": {
- *           "CURATOR_API_KEY": "sk-...",
+ *           "CURATOR_API_KEY":    "sk-...",
  *           "CURATOR_VAULT_PATH": "/path/to/vault"
  *         }
  *       }
@@ -29,188 +33,214 @@
  *   }
  */
 
-import { McpServer }            from '@modelcontextprotocol/sdk/server/mcp.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { z }                    from 'zod';
-import * as fs                  from 'node:fs/promises';
-import * as path                from 'node:path';
-import { KnowledgeCurator }     from './curator.js';
+import * as http from 'node:http';
+import * as path from 'node:path';
+import * as fs   from 'node:fs/promises';
 
-// ── Bootstrap ─────────────────────────────────────────────────────────────────
+import { McpServer }                        from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StdioServerTransport }             from '@modelcontextprotocol/sdk/server/stdio.js';
+import { StreamableHTTPServerTransport }    from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { z }                                from 'zod';
+import { CuratorAgent }                     from './agent.js';
+import type { ProcessResult }               from './agent.js';
 
-function getCurator(vaultOverride?: string): KnowledgeCurator {
-    const apiKey    = process.env.CURATOR_API_KEY;
-    const vaultPath = vaultOverride ?? process.env.CURATOR_VAULT_PATH;
-    if (!apiKey)    throw new Error('CURATOR_API_KEY env var is required');
-    if (!vaultPath) throw new Error('CURATOR_VAULT_PATH env var is required (or pass vault_path per tool)');
-    return new KnowledgeCurator({
-        apiKey,
-        vaultPath,
-        model:   process.env.CURATOR_MODEL   ?? 'deepseek-chat',
-        baseUrl: process.env.CURATOR_BASE_URL,
+// ── Config ────────────────────────────────────────────────────────────────────
+
+const API_KEY        = process.env.CURATOR_API_KEY ?? '';
+const VAULT_PATH     = process.env.CURATOR_VAULT_PATH ?? '';
+const MODEL          = process.env.CURATOR_MODEL ?? 'deepseek-chat';
+const RESEARCH_MODEL = process.env.CURATOR_RESEARCH_MODEL ?? 'deepseek-chat';
+const BASE_URL       = process.env.CURATOR_BASE_URL;
+const VM_URL         = process.env.VAULT_MANAGER_URL;
+const VM_ID          = process.env.VAULT_MANAGER_ID;
+const PORT           = process.env.CURATOR_PORT ? parseInt(process.env.CURATOR_PORT) : null;
+
+if (!API_KEY)    { process.stderr.write('[curator] CURATOR_API_KEY is required\n'); process.exit(1); }
+if (!VAULT_PATH) { process.stderr.write('[curator] CURATOR_VAULT_PATH is required\n'); process.exit(1); }
+
+// ── Agent singleton ───────────────────────────────────────────────────────────
+
+let agent: CuratorAgent | null = null;
+
+async function getAgent(): Promise<CuratorAgent> {
+    if (agent) return agent;
+    agent = new CuratorAgent({
+        apiKey:          API_KEY,
+        vaultPath:       VAULT_PATH,
+        model:           MODEL,
+        researchModel:   RESEARCH_MODEL,
+        baseUrl:         BASE_URL,
+        vaultManagerUrl: VM_URL,
+        vaultManagerId:  VM_ID,
+        onProgress:      (msg) => process.stderr.write(msg + '\n'),
     });
+    await agent.setup();
+    return agent;
 }
 
-// ── MCP server ────────────────────────────────────────────────────────────────
+// ── Tool registration ─────────────────────────────────────────────────────────
+// Factory: creates a fresh McpServer with all tools wired to the agent singleton.
+// Called once for stdio, once per HTTP request (stateless transport).
 
-const srv = new McpServer({ name: 'curator-agent', version: '0.1.0' });
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const t = srv.tool.bind(srv) as any;
+function createMcpServer(): McpServer {
+    const srv = new McpServer({ name: 'curator-agent', version: '0.3.0' });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const t = srv.tool.bind(srv) as any;
 
-// ── Tool: curator_ingest_text ─────────────────────────────────────────────────
+    // curator_process
+    t(
+        'curator_process',
+        'Curate a document into the vault. ' +
+        'Checks duplicates, normalises tags, and writes a structured .md with frontmatter. ' +
+        'Returns JSON: { written, skipped, errors, durationMs }.',
+        {
+            text: z.string().min(50).describe('Full text of the document (plain text or markdown)'),
+            source: z.string().describe('Document origin: filename, URL, email subject, etc.'),
+            area_hint: z.string().optional().describe(
+                'Area hint: general | insights | operaciones | rrhh | finanzas | legal | calidad',
+            ),
+        },
+        async ({ text, source, area_hint }: { text: string; source: string; area_hint?: string }) => {
+            const a = await getAgent();
+            const result = await a.process(text, source, area_hint);
+            return { content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
+        },
+    );
 
-t(
-    'curator_ingest_text',
-    'Analyze a document text with a powerful LLM and write structured knowledge notes to the vault. ' +
-    'Use this when you receive a document (policy, meeting minutes, regulation, technical doc) ' +
-    'that should be indexed and made available to enterprise agents.',
-    {
-        text: z.string().min(50).describe(
-            'Full text of the document to curate (plain text, markdown, or extracted PDF content)',
-        ),
-        source: z.string().describe(
-            'Document origin for audit trail: filename, URL, email subject, etc.',
-        ),
-        vault_path: z.string().optional().describe(
-            'Absolute path to the vault. Falls back to CURATOR_VAULT_PATH env var.',
-        ),
-    },
-    async ({ text, source, vault_path }: { text: string; source: string; vault_path?: string }) => {
-        const curator = getCurator(vault_path);
-        const result  = await curator.curateText(text, source);
-        const lines   = [
-            `Curation complete in ${result.durationMs}ms.`,
-            result.notesWritten.length
-                ? `Written (${result.notesWritten.length}): ${result.notesWritten.map(p => path.basename(p)).join(', ')}`
-                : 'No new notes written.',
-            result.notesSkipped.length
-                ? `Skipped — already exists (${result.notesSkipped.length}): ${result.notesSkipped.join(', ')}`
-                : '',
-            result.errors.length
-                ? `Errors: ${result.errors.join(' | ')}`
-                : '',
-        ].filter(Boolean);
-        return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
-    },
-);
+    // curator_process_file
+    t(
+        'curator_process_file',
+        'Read a file from disk and curate it into the vault. Supports .txt, .md, and plain-text formats.',
+        {
+            file_path: z.string().describe('Absolute path to the file'),
+            area_hint: z.string().optional().describe('Area hint for the classifier'),
+        },
+        async ({ file_path, area_hint }: { file_path: string; area_hint?: string }) => {
+            let text: string;
+            try {
+                text = await fs.readFile(file_path, 'utf-8');
+            } catch (err) {
+                const result: ProcessResult = { written: [], skipped: [], enriched: [], errors: [(err as Error).message], durationMs: 0 };
+                return { content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
+            }
+            const a = await getAgent();
+            const result = await a.process(text, path.basename(file_path), area_hint);
+            return { content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
+        },
+    );
 
-// ── Tool: curator_ingest_file ─────────────────────────────────────────────────
+    // curator_research
+    t(
+        'curator_research',
+        'Generate a comprehensive markdown article on a topic with LLM and save it to the vault. ' +
+        'Checks for duplicate knowledge before writing. ' +
+        'Returns JSON: { written, skipped, errors, durationMs }.',
+        {
+            topic: z.string().describe('Topic to research. Be specific for better results.'),
+        },
+        async ({ topic }: { topic: string }) => {
+            const a = await getAgent();
+            const result = await a.research(topic);
+            return { content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
+        },
+    );
 
-t(
-    'curator_ingest_file',
-    'Read a file from disk, curate its content with a powerful LLM, and write structured notes to the vault. ' +
-    'The file is moved to vault/processed/ on success or vault/failed/ on error.',
-    {
-        file_path: z.string().describe(
-            'Absolute path to the file to process. Supports .txt, .md, .csv, or any plain-text format.',
-        ),
-        vault_path: z.string().optional().describe(
-            'Absolute path to the vault. Falls back to CURATOR_VAULT_PATH env var.',
-        ),
-    },
-    async ({ file_path, vault_path }: { file_path: string; vault_path?: string }) => {
-        const curator = getCurator(vault_path);
-        const result  = await curator.curateFile(file_path);
-        const lines   = [
-            `File: ${path.basename(file_path)}`,
-            `Duration: ${result.durationMs}ms`,
-            result.notesWritten.length
-                ? `Written: ${result.notesWritten.map(p => path.basename(p)).join(', ')}`
-                : 'No new notes written.',
-            result.notesSkipped.length
-                ? `Skipped (already exists): ${result.notesSkipped.join(', ')}`
-                : '',
-            result.errors.length
-                ? `Errors: ${result.errors.join(' | ')}`
-                : '',
-        ].filter(Boolean);
-        return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
-    },
-);
+    // curator_research_url
+    t(
+        'curator_research_url',
+        'Capture a URL via Jina Reader (r.jina.ai) as clean markdown and curate it into the vault. ' +
+        'No API key required. Works with articles, docs, blog posts, GitHub READMEs. ' +
+        'Returns JSON: { written, skipped, errors, durationMs }.',
+        {
+            url: z.string().url().describe('URL to capture and curate'),
+        },
+        async ({ url }: { url: string }) => {
+            const a = await getAgent();
+            const result = await a.researchUrl(url);
+            return { content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
+        },
+    );
 
-// ── Tool: curator_list_incoming ───────────────────────────────────────────────
+    // curator_vault_status
+    t(
+        'curator_vault_status',
+        'Returns a summary of the vault: total notes, areas, and top tags.',
+        {},
+        async () => {
+            const a = await getAgent();
+            return { content: [{ type: 'text' as const, text: a.getMemory().summary() }] };
+        },
+    );
 
-t(
-    'curator_list_incoming',
-    'List files waiting in the vault/incoming/ folder (pending curation).',
-    {
-        vault_path: z.string().optional().describe(
-            'Absolute path to the vault. Falls back to CURATOR_VAULT_PATH env var.',
-        ),
-    },
-    async ({ vault_path }: { vault_path?: string }) => {
-        const vp      = vault_path ?? process.env.CURATOR_VAULT_PATH ?? '';
-        const dir     = path.join(vp, 'incoming');
-        let files: string[];
+    // curator_reload
+    t(
+        'curator_reload',
+        'Reload the vault memory index from disk. Call after external changes to the vault.',
+        {},
+        async () => {
+            const a = await getAgent();
+            await a.reloadMemory();
+            return { content: [{ type: 'text' as const, text: `Reloaded. ${a.getMemory().summary()}` }] };
+        },
+    );
+
+    return srv;
+}
+
+// ── HTTP transport ────────────────────────────────────────────────────────────
+
+async function startHttp(port: number): Promise<void> {
+    const server = http.createServer(async (req, res) => {
+        if (req.method !== 'POST' || req.url !== '/mcp') {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Use POST /mcp' }));
+            return;
+        }
+
+        // Read body
+        const chunks: Buffer[] = [];
+        for await (const chunk of req) chunks.push(chunk as Buffer);
+        let body: unknown;
         try {
-            files = await fs.readdir(dir);
+            body = JSON.parse(Buffer.concat(chunks).toString());
         } catch {
-            return { content: [{ type: 'text' as const, text: `No incoming/ folder found at ${dir}` }] };
-        }
-        const filtered = files.filter(f => !f.startsWith('.'));
-        const text = filtered.length
-            ? `${filtered.length} file(s) pending:\n` + filtered.map(f => `  • ${f}`).join('\n')
-            : 'No files pending in incoming/.';
-        return { content: [{ type: 'text' as const, text }] };
-    },
-);
-
-// ── Tool: curator_process_incoming ────────────────────────────────────────────
-
-t(
-    'curator_process_incoming',
-    'Process all files currently in vault/incoming/. ' +
-    'Each file is curated and moved to vault/processed/ or vault/failed/.',
-    {
-        vault_path: z.string().optional().describe(
-            'Absolute path to the vault. Falls back to CURATOR_VAULT_PATH env var.',
-        ),
-    },
-    async ({ vault_path }: { vault_path?: string }) => {
-        const vp      = vault_path ?? process.env.CURATOR_VAULT_PATH ?? '';
-        const curator = getCurator(vp);
-        const dir     = path.join(vp, 'incoming');
-
-        let files: string[];
-        try {
-            files = (await fs.readdir(dir)).filter(f => !f.startsWith('.'));
-        } catch {
-            return { content: [{ type: 'text' as const, text: `No incoming/ folder at ${dir}` }] };
+            res.writeHead(400).end('Invalid JSON');
+            return;
         }
 
-        if (!files.length) {
-            return { content: [{ type: 'text' as const, text: 'No files to process.' }] };
-        }
+        // Each request gets a fresh McpServer — CuratorAgent is the shared singleton
+        const srv       = createMcpServer();
+        const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+        await srv.connect(transport);
+        await transport.handleRequest(req, res, body);
+    });
 
-        const summaries: string[] = [];
-        for (const file of files) {
-            const filePath = path.join(dir, file);
-            const result   = await curator.curateFile(filePath);
-            summaries.push(
-                `${file}: ${result.notesWritten.length} written, ` +
-                `${result.notesSkipped.length} skipped, ` +
-                `${result.errors.length} errors (${result.durationMs}ms)`,
-            );
-        }
+    await new Promise<void>(resolve => server.listen(port, resolve));
+    process.stderr.write(`[curator] HTTP MCP server on :${port}/mcp\n`);
+}
 
-        return {
-            content: [{
-                type: 'text' as const,
-                text: `Processed ${files.length} file(s):\n` + summaries.map(s => `  ${s}`).join('\n'),
-            }],
-        };
-    },
-);
+// ── Stdio transport ───────────────────────────────────────────────────────────
 
-// ── Start ─────────────────────────────────────────────────────────────────────
-
-async function main(): Promise<void> {
+async function startStdio(): Promise<void> {
+    const srv       = createMcpServer();
     const transport = new StdioServerTransport();
     await srv.connect(transport);
-    process.stderr.write('[curator-agent] MCP server ready (stdio)\n');
+    process.stderr.write('[curator] stdio MCP server ready\n');
+}
+
+// ── Main ──────────────────────────────────────────────────────────────────────
+
+async function main(): Promise<void> {
+    await getAgent(); // pre-warm — loads VaultMemory before first request
+
+    if (PORT) {
+        await startHttp(PORT);
+    } else {
+        await startStdio();
+    }
 }
 
 main().catch(err => {
-    process.stderr.write(`[curator-agent] Fatal: ${(err as Error).message}\n`);
+    process.stderr.write(`[curator] Fatal: ${(err as Error).message}\n`);
     process.exit(1);
 });

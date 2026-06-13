@@ -1,0 +1,88 @@
+version: 1
+
+orchestrator:
+  name: "Orquestador Empresa"
+  provider: deepseek
+
+# Flows estáticos — se detectan automáticamente por trigger regex
+# Si la tarea no matchea ninguno, el LLM genera el plan dinámicamente
+flows:
+  - id: onboarding-empleado
+    file: ./flows/onboarding-empleado.yaml
+    trigger: "onboarding|nuevo empleado|alta de personal|incorporación"
+  vault:
+    path: "/ruta/a/tu/vault"     # path al vault de Obsidian
+    embedder: simple              # 'simple' (sin deps) o 'ollama'
+
+providers:
+  deepseek:
+    base_url: "https://api.deepseek.com/v1"
+    api_key: "${DEEPSEEK_API_KEY}"
+    model: "deepseek-chat"
+  local:
+    base_url: "http://localhost:11434/v1"
+    api_key: "ollama"
+    model: "qwen2.5:7b"
+
+agents:
+  # ── Onboarding ────────────────────────────────────────────────────────────
+
+  - id: hr-agent
+    name: "Agente RRHH"
+    description: "Gestiona el proceso de incorporación de nuevos empleados"
+    capabilities: [onboarding, rrhh, documentacion, checklist]
+    provider: local               # datos personales → LLM local
+    domain: rrhh                  # dominio enterprise para reflection (Cable 2)
+    gate: true                    # pausa para aprobación humana antes de continuar
+    gate_criteria:
+      - "El checklist de documentación está completo"
+      - "Los datos del empleado son correctos"
+      - "Las fechas de incorporación están confirmadas"
+
+  - id: it-agent
+    name: "Agente IT"
+    description: "Provisiona accesos, cuentas y equipamiento tecnológico"
+    capabilities: [accesos, cuentas, equipamiento, it]
+    provider: local               # credenciales → LLM local
+    domain: operaciones
+
+  - id: legal-agent
+    name: "Agente Legal"
+    description: "Verifica contratos, cláusulas y cumplimiento normativo"
+    capabilities: [contratos, legal, compliance, normativa]
+    provider: local               # documentos legales → LLM local
+    domain: legal
+    gate: true
+    gate_criteria:
+      - "El contrato cumple la normativa vigente"
+      - "Todas las cláusulas fueron revisadas"
+
+  - id: writer-agent
+    name: "Agente Redactor"
+    description: "Consolida resultados y genera informes y comunicaciones"
+    capabilities: [redaccion, informes, comunicaciones, resumen]
+    provider: deepseek            # redacción → cloud por calidad
+    domain: operaciones
+
+  # ── Análisis ──────────────────────────────────────────────────────────────
+
+  - id: architect-agent
+    name: "Agente Arquitecto"
+    description: "Analiza arquitectura de sistemas, decisiones técnicas e impacto de cambios"
+    capabilities: [arquitectura, sistemas, impacto, diseno-tecnico]
+    provider: deepseek
+    domain: operaciones
+
+  - id: data-analyst-agent
+    name: "Agente Analista de Datos"
+    description: "Analiza datos, volúmenes, métricas y genera insights"
+    capabilities: [datos, metricas, analisis, reporting]
+    provider: deepseek
+    domain: finanzas
+
+  - id: risk-agent
+    name: "Agente de Riesgos"
+    description: "Identifica y evalúa riesgos técnicos, operacionales y de negocio"
+    capabilities: [riesgos, evaluacion, mitigacion, contingencia]
+    provider: deepseek
+    domain: operaciones
