@@ -22,7 +22,8 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import * as path from 'node:path';
-import * as fs from 'node:fs';
+import * as fs   from 'node:fs';
+import * as http from 'node:http';
 import {
     ObsidianRAGProvider,
     SimpleEmbedder,
@@ -344,6 +345,75 @@ function toStepResult(r: ExecutionResult): import('./run-store.js').StepResult {
     };
 }
 
+// ── startRun — shared by MCP tool and HTTP server ────────────────────────────
+
+interface StartRunOk {
+    runId:      string;
+    planSource: 'static' | 'dynamic';
+    plan:       import('./planner.js').TaskPlan;
+    config:     OrchestratorConfig;
+}
+
+async function startRun(
+    configPath: string,
+    task:       string,
+    flowId?:    string,
+    payload:    Record<string, string> = {},
+): Promise<StartRunOk | { error: string }> {
+    let config: OrchestratorConfig;
+    try { config = loadConfig(configPath); }
+    catch (err) { return { error: `Config error: ${err instanceof Error ? err.message : String(err)}` }; }
+
+    const dataDir    = resolveDataDir(configPath, config);
+    const rag        = await buildRAG(config, dataDir).catch(() => null);
+    const reflection = config.orchestrator.vault
+        ? await getReflection(config.orchestrator.vault.path).catch(() => undefined)
+        : undefined;
+    const store      = getStore(configPath, config);
+    const configDir  = path.dirname(path.resolve(configPath));
+
+    let plan: import('./planner.js').TaskPlan;
+    let planSource: 'static' | 'dynamic';
+
+    if (flowId) {
+        const entry = config.flows?.find(f => f.id === flowId);
+        if (!entry) return { error: `Flow "${flowId}" not declared in orchestrator.yaml` };
+        try {
+            const { loadFlow } = await import('./static-flow.js');
+            plan       = flowToTaskPlan(loadFlow(path.resolve(configDir, entry.file)), payload);
+            planSource = 'static';
+        } catch (err) {
+            return { error: `Flow load error: ${err instanceof Error ? err.message : String(err)}` };
+        }
+    } else if (config.flows?.length) {
+        const matched = matchFlow(config.flows, configDir, task);
+        if (matched) {
+            plan       = flowToTaskPlan(matched.flow, payload);
+            planSource = 'static';
+        } else {
+            plan       = await planDynamic(config, rag, task, reflection);
+            planSource = 'dynamic';
+        }
+    } else {
+        plan       = await planDynamic(config, rag, task, reflection);
+        planSource = 'dynamic';
+    }
+
+    if ('error' in plan) return { error: (plan as { error: string }).error };
+
+    const runId = store.newRunId();
+    store.save({ runId, task, configPath, status: 'running', startedAt: ts(), updatedAt: ts(), plan, completedSteps: [] });
+
+    setImmediate(() => {
+        executeInBackground(runId, configPath, config, plan, rag).catch(err => {
+            const s = store.load(runId);
+            if (s) store.save({ ...s, status: 'failed', error: String(err) });
+        });
+    });
+
+    return { runId, planSource, plan, config };
+}
+
 // ── MCP Server ────────────────────────────────────────────────────────────────
 
 const srv = new McpServer({
@@ -368,77 +438,10 @@ srv.tool(
         ),
     },
     async ({ config_path, task, flow_id, payload = {} }) => {
-        let config: OrchestratorConfig;
-        try {
-            config = loadConfig(config_path);
-        } catch (err) {
-            return ok(`Config error: ${err instanceof Error ? err.message : String(err)}`);
-        }
+        const result = await startRun(config_path, task, flow_id, payload);
+        if ('error' in result) return ok(result.error);
 
-        const dataDir    = resolveDataDir(config_path, config);
-        const rag        = await buildRAG(config, dataDir).catch(() => null);
-        const reflection = config.orchestrator.vault
-            ? await getReflection(config.orchestrator.vault.path).catch(() => undefined)
-            : undefined;
-        const store      = getStore(config_path, config);
-        const configDir  = path.dirname(path.resolve(config_path));
-
-        // ── Resolve plan: static flow or dynamic TaskPlanner ─────────────────
-        let plan: import('./planner.js').TaskPlan;
-        let planSource: 'static' | 'dynamic';
-
-        // Explicit flow_id → load directly
-        if (flow_id) {
-            const entry = config.flows?.find(f => f.id === flow_id);
-            if (!entry) return ok(`Flow "${flow_id}" not declared in orchestrator.yaml`);
-            const flowPath = path.resolve(configDir, entry.file);
-            try {
-                const { loadFlow } = await import('./static-flow.js');
-                const flow = loadFlow(flowPath);
-                plan       = flowToTaskPlan(flow, payload);
-                planSource = 'static';
-            } catch (err) {
-                return ok(`Flow load error: ${err instanceof Error ? err.message : String(err)}`);
-            }
-        // Auto-detect via trigger matching
-        } else if (config.flows?.length) {
-            const matched = matchFlow(config.flows, configDir, task);
-            if (matched) {
-                plan       = flowToTaskPlan(matched.flow, payload);
-                planSource = 'static';
-            } else {
-                plan       = await planDynamic(config, rag, task, reflection);
-                planSource = 'dynamic';
-            }
-        // No flows declared → always dynamic
-        } else {
-            plan       = await planDynamic(config, rag, task, reflection);
-            planSource = 'dynamic';
-        }
-
-        if ('error' in plan) return ok((plan as { error: string }).error);
-
-        // ── Create run and fire background execution ──────────────────────────
-        const runId  = store.newRunId();
-        const state: RunState = {
-            runId,
-            task,
-            configPath:     config_path,
-            status:         'running',
-            startedAt:      ts(),
-            updatedAt:      ts(),
-            plan,
-            completedSteps: [],
-        };
-        store.save(state);
-
-        setImmediate(() => {
-            executeInBackground(runId, config_path, config, plan, rag).catch((err) => {
-                const s = store.load(runId);
-                if (s) store.save({ ...s, status: 'failed', error: String(err) });
-            });
-        });
-
+        const { runId, planSource, plan, config } = result;
         const planLines = plan.subtasks.map(st => {
             const agentCfg  = config.agents.find(a => a.id === st.agent_id);
             const gateLabel = (st.gate ?? agentCfg?.gate) ? ' [GATE]' : '';
@@ -948,12 +951,212 @@ srv.tool(
     },
 );
 
+// ── HTTP Event Trigger Server (Milestone 5) ───────────────────────────────────
+// Activated by ORCHESTRATOR_HTTP_PORT + ORCHESTRATOR_CONFIG env vars.
+// Lets external systems (n8n, HR platforms, ERPs) trigger flows via HTTP
+// without going through Claude Desktop / MCP.
+//
+// Endpoints:
+//   POST /run          — trigger a new run
+//   GET  /status/:id   — poll run status (n8n Wait node)
+//   POST /approve      — approve or reject a waiting gate
+//   GET  /health       — liveness check
+
+async function startHttpServer(
+    port:       number,
+    configPath: string,
+    apiKey:     string | undefined,
+): Promise<http.Server> {
+
+    function readBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
+        return new Promise((resolve, reject) => {
+            const chunks: Buffer[] = [];
+            req.on('data', c => chunks.push(c as Buffer));
+            req.on('end', () => {
+                try {
+                    const text = Buffer.concat(chunks).toString('utf-8').trim();
+                    resolve(text ? JSON.parse(text) as Record<string, unknown> : {});
+                } catch { reject(new Error('Invalid JSON body')); }
+            });
+            req.on('error', reject);
+        });
+    }
+
+    function reply(res: http.ServerResponse, status: number, body: unknown): void {
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(body));
+    }
+
+    const server = http.createServer(async (req, res) => {
+        // Auth
+        if (apiKey) {
+            if (req.headers['authorization'] !== `Bearer ${apiKey}`) {
+                reply(res, 401, { error: 'Unauthorized — set Authorization: Bearer <ORCHESTRATOR_API_KEY>' });
+                return;
+            }
+        }
+
+        const urlPath = new URL(req.url ?? '/', 'http://localhost').pathname;
+
+        try {
+            // ── GET /health ──────────────────────────────────────────────────
+            if (req.method === 'GET' && urlPath === '/health') {
+                reply(res, 200, { status: 'ok', configPath });
+                return;
+            }
+
+            // ── POST /run ────────────────────────────────────────────────────
+            if (req.method === 'POST' && urlPath === '/run') {
+                const body    = await readBody(req);
+                const task    = String(body['task'] ?? '').trim();
+                const flowId  = body['flow_id'] != null ? String(body['flow_id']) : undefined;
+                const payload = (body['payload'] ?? {}) as Record<string, string>;
+
+                if (!task) { reply(res, 400, { error: 'task is required' }); return; }
+
+                const result = await startRun(configPath, task, flowId, payload);
+                if ('error' in result) { reply(res, 422, { error: result.error }); return; }
+
+                reply(res, 202, {
+                    runId:      result.runId,
+                    status:     'running',
+                    planSource: result.planSource,
+                    subtasks:   result.plan.subtasks.length,
+                });
+                return;
+            }
+
+            // ── GET /status/:runId ───────────────────────────────────────────
+            if (req.method === 'GET' && urlPath.startsWith('/status/')) {
+                const runId = urlPath.slice('/status/'.length);
+                if (!runId) { reply(res, 400, { error: 'runId required in path' }); return; }
+
+                let config: OrchestratorConfig;
+                try { config = loadConfig(configPath); }
+                catch (err) { reply(res, 500, { error: `Config error: ${err instanceof Error ? err.message : String(err)}` }); return; }
+
+                const state = getStore(configPath, config).load(runId);
+                if (!state) { reply(res, 404, { error: `Run not found: ${runId}` }); return; }
+
+                reply(res, 200, {
+                    runId:          state.runId,
+                    status:         state.status,
+                    task:           state.task,
+                    startedAt:      state.startedAt,
+                    completedAt:    state.completedAt,
+                    completedSteps: state.completedSteps.length,
+                    waitingGate: state.waitingGate ? {
+                        stepId:      state.waitingGate.stepId,
+                        agentId:     state.waitingGate.agentId,
+                        criteria:    state.waitingGate.criteria,
+                        output:      state.waitingGate.output.slice(0, 1000),
+                        requestedAt: state.waitingGate.requestedAt,
+                    } : undefined,
+                    finalReport: state.finalReport?.slice(0, 2000),
+                    error:       state.error,
+                });
+                return;
+            }
+
+            // ── POST /approve ────────────────────────────────────────────────
+            if (req.method === 'POST' && urlPath === '/approve') {
+                const body     = await readBody(req);
+                const runId    = String(body['run_id'] ?? '').trim();
+                const approved = Boolean(body['approved']);
+                const notes    = body['notes'] != null ? String(body['notes']) : undefined;
+
+                if (!runId) { reply(res, 400, { error: 'run_id is required' }); return; }
+
+                let config: OrchestratorConfig;
+                try { config = loadConfig(configPath); }
+                catch (err) { reply(res, 500, { error: `Config error: ${err instanceof Error ? err.message : String(err)}` }); return; }
+
+                const store = getStore(configPath, config);
+                const state = store.load(runId);
+                if (!state)                          { reply(res, 404, { error: `Run not found: ${runId}` }); return; }
+                if (state.status !== 'waiting_gate') { reply(res, 409, { error: `Run not waiting for a gate (status: ${state.status})` }); return; }
+
+                const gate = state.waitingGate!;
+
+                const reflection = config.orchestrator.vault
+                    ? await getReflection(config.orchestrator.vault.path).catch(() => undefined)
+                    : undefined;
+                if (reflection && gate.appliedRuleIds?.length) {
+                    const outcome: 'success' | 'failure' = approved ? 'success' : 'failure';
+                    for (const id of gate.appliedRuleIds) {
+                        reflection.recordRuleOutcome(id, outcome).catch(() => {});
+                    }
+                }
+
+                if (!approved) {
+                    store.save({
+                        ...state, status: 'failed', completedAt: ts(),
+                        error: `Gate rejected. Step: ${gate.stepId}. Notes: ${notes ?? '(none)'}`,
+                        waitingGate: undefined,
+                    });
+                    reply(res, 200, { runId, status: 'failed', stepId: gate.stepId });
+                    return;
+                }
+
+                store.save({ ...state, status: 'running', waitingGate: undefined });
+
+                const rag = await buildRAG(config, resolveDataDir(configPath, config)).catch(() => null);
+                const priorResults: ExecutionResult[] = state.completedSteps.map(s => ({
+                    subtask_id: s.stepId, agent_id: s.agentId, task: s.task,
+                    result: s.output, success: s.success, duration_ms: s.durationMs,
+                }));
+
+                setImmediate(() => {
+                    executeInBackground(runId, configPath, config, state.plan, rag, priorResults).catch(err => {
+                        const s = store.load(runId);
+                        if (s) store.save({ ...s, status: 'failed', error: String(err) });
+                    });
+                });
+
+                reply(res, 200, { runId, status: 'running', stepId: gate.stepId });
+                return;
+            }
+
+            reply(res, 404, {
+                error:     'Not found',
+                endpoints: ['GET /health', 'POST /run', 'GET /status/:runId', 'POST /approve'],
+            });
+
+        } catch (err) {
+            process.stderr.write(`[orchestrator-agent] HTTP error: ${err instanceof Error ? err.message : String(err)}\n`);
+            reply(res, 500, { error: err instanceof Error ? err.message : String(err) });
+        }
+    });
+
+    await new Promise<void>(resolve => server.listen(port, resolve));
+    return server;
+}
+
 // ── Start ─────────────────────────────────────────────────────────────────────
 
 async function main() {
+    const httpPort      = process.env['ORCHESTRATOR_HTTP_PORT'];
+    const httpConfig    = process.env['ORCHESTRATOR_CONFIG'];
+    const httpApiKey    = process.env['ORCHESTRATOR_API_KEY'] || undefined;
+
+    if (httpPort && httpConfig) {
+        const port = parseInt(httpPort, 10);
+        if (isNaN(port)) {
+            process.stderr.write(`[orchestrator-agent] Invalid ORCHESTRATOR_HTTP_PORT: ${httpPort}\n`);
+        } else {
+            await startHttpServer(port, path.resolve(httpConfig), httpApiKey);
+            process.stderr.write(
+                `[orchestrator-agent] HTTP trigger on :${port}` +
+                ` — config: ${httpConfig}` +
+                (httpApiKey ? ' — auth: Bearer ***' : ' — WARNING: no API key set, all requests accepted') +
+                '\n',
+            );
+        }
+    }
+
     const transport = new StdioServerTransport();
     await srv.connect(transport);
-    process.stderr.write('[orchestrator-agent] Running\n');
+    process.stderr.write('[orchestrator-agent] MCP running\n');
 }
 
 main().catch(e => {
