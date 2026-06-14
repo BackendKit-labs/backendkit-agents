@@ -102,9 +102,28 @@ export const KnowledgeSearchSchema = z.object({
     autoSynthesize: z.boolean().optional().describe('Auto-generate synthesis'),
 });
 
-export type CuratorConfig = z.infer<typeof CuratorConfigSchema>;
-export type CuratorProcess = z.infer<typeof CuratorProcessSchema>;
-export type KnowledgeSearch = z.infer<typeof KnowledgeSearchSchema>;
+export const KnowledgeSearchWithVaultSchema = z.object({
+    vaultPath: z.string().min(1).describe('Absolute path to vault directory'),
+    query:     z.string().min(3).max(500).describe('Search query'),
+    topK:      z.number().int().min(1).max(20).optional().default(5),
+});
+
+export const KnowledgeReindexSchema = z.object({
+    vaultPath: z.string().min(1).describe('Absolute path to vault directory'),
+});
+
+export const CuratorFileSchema = z.object({
+    vaultPath: z.string().min(1).describe('Absolute path to vault directory'),
+    fileName:  z.string().min(1).max(255).describe('Original file name'),
+    content:   z.string().min(1).describe('File content to curate'),
+});
+
+export type CuratorConfig        = z.infer<typeof CuratorConfigSchema>;
+export type CuratorProcess       = z.infer<typeof CuratorProcessSchema>;
+export type KnowledgeSearch      = z.infer<typeof KnowledgeSearchSchema>;
+export type KnowledgeSearchWithVault = z.infer<typeof KnowledgeSearchWithVaultSchema>;
+export type KnowledgeReindex     = z.infer<typeof KnowledgeReindexSchema>;
+export type CuratorFile          = z.infer<typeof CuratorFileSchema>;
 
 /**
  * Validate request body against schema
