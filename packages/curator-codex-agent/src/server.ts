@@ -48,22 +48,24 @@ import { ConfigManager }                 from './api/config.js';
 // ── Configuration ────────────────────────────────────────────────────────────
 
 const API_KEY      = process.env.CURATOR_API_KEY ?? '';
-const VAULT_PATH   = process.env.CURATOR_OUTPUT_PATH ?? '';
 const HTTP_PORT    = process.env.CURATOR_HTTP_PORT ? parseInt(process.env.CURATOR_HTTP_PORT) : null;
 const ENABLE_HTTP   = HTTP_PORT !== null;
 
 let knowledgeEngine: KnowledgeEngine;
 let configManager: ConfigManager;
 
-if (!API_KEY)    { console.error('[codex] ✗ CURATOR_API_KEY is required'); process.exit(1); }
-if (!VAULT_PATH) { console.error('[codex] ✗ CURATOR_OUTPUT_PATH is required'); process.exit(1); }
+if (!API_KEY) { console.error('[codex] ✗ CURATOR_API_KEY is required'); process.exit(1); }
 
 function log(msg: string): void {
     console.error(`[codex] ${msg}`);
 }
 
 function makeAnalyzer(): CodeAnalyzer {
-    return new CodeAnalyzer({ provider: createProvider(), vaultPath: VAULT_PATH });
+    const vaultPath = configManager.getOutputPath();
+    if (!vaultPath) {
+        throw new Error('No vault path configured. Set outputPath in workspace configuration.');
+    }
+    return new CodeAnalyzer({ provider: createProvider(), vaultPath });
 }
 
 // ── MCP Server Factory ───────────────────────────────────────────────────────
@@ -641,28 +643,32 @@ async function main(): Promise<void> {
     log('╔════════════════════════════════════════╗');
     log('║  Curator-Codex Agent — MCP Server      ║');
     log('╚════════════════════════════════════════╝');
-    log(`Vault:     ${VAULT_PATH}`);
-    log(`Model:     ${process.env.CURATOR_MODEL || 'deepseek-reasoner'}`);
 
-    // Initialize Configuration Manager
-    try {
-        configManager = new ConfigManager();
-    } catch (err) {
-        log(`⚠ ConfigManager initialization failed: ${(err as Error).message}`);
-        configManager = new ConfigManager({ outputPath: VAULT_PATH });
+    // Initialize Configuration Manager (reads workspace.json)
+    configManager = new ConfigManager();
+    const vaultPath = configManager.getOutputPath();
+
+    if (!vaultPath) {
+        log('✗ No vault path configured.');
+        log('  Set outputPath in curator-workspace.json for active workspace');
+        process.exit(1);
     }
+
+    log(`Vault:     ${vaultPath}`);
+    log(`Workspace: ${configManager.getCurrentWorkspace()}`);
+    log(`Model:     ${process.env.CURATOR_MODEL || 'deepseek-reasoner'}`);
 
     // Initialize Knowledge Engine
     try {
         log('Initializing knowledge engine...');
-        knowledgeEngine = new KnowledgeEngine(createProvider(), VAULT_PATH);
+        knowledgeEngine = new KnowledgeEngine(createProvider(), vaultPath);
         await knowledgeEngine.initialize();
         log('✓ Knowledge engine ready');
     } catch (err) {
         log(`⚠ Knowledge engine initialization failed: ${(err as Error).message}`);
         log('  (Curation will work, RAG search will be unavailable)');
         // Don't exit, allow curation-only mode
-        knowledgeEngine = new KnowledgeEngine(createProvider(), VAULT_PATH);
+        knowledgeEngine = new KnowledgeEngine(createProvider(), vaultPath);
     }
 
     // Start Stdio (always)
