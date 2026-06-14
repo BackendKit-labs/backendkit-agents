@@ -9,11 +9,12 @@ const FlowStepSchema = z.object({
     id:             z.string(),
     agent:          z.string(),
     task:           z.string(),
-    capability:     z.string().optional(),         // override agent default capability
-    input:          z.record(z.unknown()).optional(), // extra structured input fields
+    capability:     z.string().optional(),
+    input:          z.record(z.unknown()).optional(),
     depends_on:     z.array(z.string()).default([]),
     gate:           z.boolean().optional(),
     gate_criteria:  z.array(z.string()).optional(),
+    required:       z.boolean().optional(),        // if true, flow pauses on failure until orchestrator_retry
 });
 
 const FlowSchema = z.object({

@@ -7,16 +7,17 @@ import type { StepResult } from './executor.js';
 export type RunStatus = 'running' | 'waiting_gate' | 'done' | 'failed' | 'cancelled';
 
 export interface RunState {
-    id:           string;
-    flowId:       string;
-    status:       RunStatus;
-    input:        Record<string, unknown>;
-    results:      StepResult[];
-    gateStepId?:  string;
-    summary?:     string;
-    error?:       string;
-    createdAt:    string;
-    updatedAt:    string;
+    id:            string;
+    flowId:        string;
+    status:        RunStatus;
+    input:         Record<string, unknown>;
+    results:       StepResult[];
+    gateStepId?:   string;
+    failedStepId?: string;
+    summary?:      string;
+    error?:        string;
+    createdAt:     string;
+    updatedAt:     string;
 }
 
 // ── RunStore — simple file-based persistence ──────────────────────────────────

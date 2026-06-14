@@ -27,7 +27,7 @@ import { FlowExecutor }         from './executor.js';
 import { matchFlow, loadFlow }  from './flow.js';
 import { RunStore }             from './run-store.js';
 import type { RunState }        from './run-store.js';
-import type { GateHit, FlowResult } from './executor.js';
+import type { GateHit, FlowResult, StepFailed } from './executor.js';
 
 // ── Bootstrap ─────────────────────────────────────────────────────────────────
 
@@ -51,8 +51,12 @@ const executor  = new FlowExecutor({
 const ok  = (text: string) => ({ content: [{ type: 'text' as const, text }] });
 const ts  = () => new Date().toISOString();
 
-function isGate(r: FlowResult | GateHit): r is GateHit {
+function isGate(r: FlowResult | GateHit | StepFailed): r is GateHit {
     return (r as GateHit).gateRequired === true;
+}
+
+function isStepFailed(r: FlowResult | GateHit | StepFailed): r is StepFailed {
+    return (r as StepFailed).stepFailed === true;
 }
 
 async function executeAndPersist(
@@ -84,6 +88,24 @@ async function executeAndPersist(
             `\nApprove: orchestrator_approve(run_id="${run.id}")`,
             `Reject:  orchestrator_reject(run_id="${run.id}")`,
         ].filter(Boolean).join('\n');
+    }
+
+    if (isStepFailed(result)) {
+        Object.assign(run, {
+            status:        'waiting_retry',
+            results:       result.completedSoFar,
+            failedStepId:  result.stepId,
+            error:         result.error,
+            updatedAt:     ts(),
+        });
+        await store.save(run);
+        return [
+            `✗ Required step "${result.stepId}" (agent: ${result.agentId}) failed`,
+            `Run ID: ${run.id}`,
+            `\nError: ${result.error}`,
+            `\nWhen the agent recovers, retry with:`,
+            `orchestrator_retry(run_id="${run.id}")`,
+        ].join('\n');
     }
 
     Object.assign(run, {
@@ -171,7 +193,7 @@ server.tool(
         try {
             const flow   = loadFlow(path.resolve(configDir, entry.file));
             const input  = { ...run.input, ...(feedback ? { approval_feedback: feedback } : {}) };
-            const result = await executor.execute(flow, input, run.gateStepId, run.results);
+            const result = await executor.execute(flow, input, run.results);
 
             if (isGate(result)) {
                 Object.assign(run, {
@@ -188,6 +210,23 @@ server.tool(
                 ].filter(Boolean).join('\n'));
             }
 
+            if (isStepFailed(result)) {
+                Object.assign(run, {
+                    status:       'waiting_retry',
+                    results:      result.completedSoFar,
+                    failedStepId: result.stepId,
+                    error:        result.error,
+                    updatedAt:    ts(),
+                });
+                await store.save(run);
+                return ok([
+                    `✗ Required step "${result.stepId}" (agent: ${result.agentId}) failed`,
+                    `\nError: ${result.error}`,
+                    `\nWhen the agent recovers, retry with:`,
+                    `orchestrator_retry(run_id="${run_id}")`,
+                ].join('\n'));
+            }
+
             Object.assign(run, {
                 status:    result.complete ? 'done' : 'failed',
                 results:   result.steps,
@@ -198,6 +237,75 @@ server.tool(
             return ok(result.summary);
         } catch (err) {
             return ok(`Error resuming run: ${(err as Error).message}`);
+        }
+    },
+);
+
+// ── Tool: orchestrator_retry ───────────────────────────────────────────────────
+
+server.tool(
+    'orchestrator_retry',
+    'Retry a flow paused because a required step failed. Use when the failing agent has recovered.',
+    {
+        run_id:   z.string().describe('Run ID returned when the required step failed'),
+        feedback: z.string().optional().describe('Optional context to pass to the retried step'),
+    },
+    async ({ run_id, feedback }) => {
+        const run = await store.get(run_id);
+        if (!run) return ok(`Run '${run_id}' not found`);
+        if (run.status !== 'waiting_retry') return ok(`Run '${run_id}' is not waiting for retry (status: ${run.status})`);
+
+        const entry = (config.flows ?? []).find(f => f.id === run.flowId);
+        if (!entry) return ok(`Flow '${run.flowId}' not found in config`);
+
+        try {
+            const flow   = loadFlow(path.resolve(configDir, entry.file));
+            const input  = { ...run.input, ...(feedback ? { retry_feedback: feedback } : {}) };
+            // run.results contains only the successful steps before the failure;
+            // the failed step is not in the list, so executor will re-run it.
+            const result = await executor.execute(flow, input, run.results);
+
+            if (isStepFailed(result)) {
+                Object.assign(run, {
+                    results:      result.completedSoFar,
+                    failedStepId: result.stepId,
+                    error:        result.error,
+                    updatedAt:    ts(),
+                });
+                await store.save(run);
+                return ok([
+                    `✗ Step "${result.stepId}" (agent: ${result.agentId}) failed again`,
+                    `\nError: ${result.error}`,
+                    `\nRetry again with: orchestrator_retry(run_id="${run_id}")`,
+                ].join('\n'));
+            }
+
+            if (isGate(result)) {
+                Object.assign(run, {
+                    status:    'waiting_gate',
+                    results:   result.completedSoFar,
+                    gateStepId: result.stepId,
+                    updatedAt: ts(),
+                });
+                await store.save(run);
+                return ok([
+                    `⏸ Gate reached at step "${result.stepId}" (agent: ${result.agentId})`,
+                    `\nOutput:\n${result.output}`,
+                    result.criteria.length ? `\nCriteria:\n${result.criteria.map(c => `  • ${c}`).join('\n')}` : '',
+                    `\nApprove: orchestrator_approve(run_id="${run_id}")`,
+                ].filter(Boolean).join('\n'));
+            }
+
+            Object.assign(run, {
+                status:    result.complete ? 'done' : 'failed',
+                results:   result.steps,
+                summary:   result.summary,
+                updatedAt: ts(),
+            });
+            await store.save(run);
+            return ok(result.summary);
+        } catch (err) {
+            return ok(`Error retrying run: ${(err as Error).message}`);
         }
     },
 );

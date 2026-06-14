@@ -23,6 +23,15 @@ export interface GateHit {
     pendingSteps:   string[];
 }
 
+export interface StepFailed {
+    stepFailed:     true;
+    stepId:         string;
+    agentId:        string;
+    error:          string;
+    completedSoFar: StepResult[];   // only successful steps before the failure
+    pendingSteps:   string[];
+}
+
 export interface FlowResult {
     flowId:    string;
     steps:     StepResult[];
@@ -50,22 +59,21 @@ export class FlowExecutor {
     }
 
     async execute(
-        flow:           Flow,
-        input:          Record<string, unknown> = {},
-        resumeAfter?:   string,                   // stepId to resume from (after gate approval)
-        priorResults:   StepResult[] = [],
-    ): Promise<FlowResult | GateHit> {
+        flow:         Flow,
+        input:        Record<string, unknown> = {},
+        priorResults: StepResult[] = [],
+    ): Promise<FlowResult | GateHit | StepFailed> {
         const context: AgentContext = {
             tenantId:  this.tenantId,
             traceId:   `${flow.id}-${Date.now()}`,
             requestId: crypto.randomUUID(),
         };
 
+        // Steps already in completed are skipped — covers both gate resume and retry resume.
         const completed = new Map<string, StepResult>(priorResults.map(r => [r.stepId, r]));
 
         for (const step of flow.steps) {
-            // Skip any step already completed (including the gate step that triggered the pause)
-            if (resumeAfter && completed.has(step.id)) continue;
+            if (completed.has(step.id)) continue;
 
             // Wait for dependencies
             for (const depId of step.depends_on) {
@@ -77,6 +85,20 @@ export class FlowExecutor {
             this.onProgress(`[${flow.id}] step ${step.id} → agent ${step.agentId ?? step.agent}`);
 
             const result = await this.runStep(step, input, completed, context);
+            const pending = flow.steps.slice(flow.steps.indexOf(step) + 1).map(s => s.id);
+
+            // Required step failed → pause flow until orchestrator_retry
+            if (!result.success && (step.required ?? false)) {
+                return {
+                    stepFailed:     true,
+                    stepId:         step.id,
+                    agentId:        step.agent,
+                    error:          result.output,
+                    completedSoFar: [...completed.values()],  // successful steps only (failed not added yet)
+                    pendingSteps:   pending,
+                };
+            }
+
             completed.set(step.id, result);
 
             // Gate check
@@ -85,7 +107,6 @@ export class FlowExecutor {
 
             if (hasGate) {
                 const criteria = step.gate_criteria ?? agentCfg.gate_criteria ?? [];
-                const pending  = flow.steps.slice(flow.steps.indexOf(step) + 1).map(s => s.id);
                 return {
                     gateRequired:   true,
                     stepId:         step.id,
