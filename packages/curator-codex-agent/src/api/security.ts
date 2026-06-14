@@ -28,7 +28,7 @@ export function createAuthMiddleware(apiKeys: Map<string, { rateLimit: number }>
 
         if (!authHeader || !authHeader.startsWith('Bearer ')) {
             // No auth required for health/status endpoints
-            if (req.path === '/health' || req.path === '/status' || req.path === '/') {
+            if (req.path === '/health' || req.path === '/status' || req.path === '/' || req.path === '/v1/agent/health') {
                 return next();
             }
             return res.status(401).json({

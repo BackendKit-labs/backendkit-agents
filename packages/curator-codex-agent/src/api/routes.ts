@@ -4,9 +4,10 @@
  */
 
 import { Router, Request, Response } from 'express';
-import * as fsp  from 'node:fs/promises';
-import * as os   from 'node:os';
-import * as path from 'node:path';
+import * as fsp    from 'node:fs/promises';
+import * as os     from 'node:os';
+import * as path   from 'node:path';
+import * as crypto from 'node:crypto';
 import { CodeAnalyzer } from '../analyzer.js';
 import { KnowledgeEngine } from '../knowledge/engine.js';
 import { createProvider } from '../providers/index.js';
@@ -363,6 +364,214 @@ export function createRoutes(configManager: ConfigManager): Router {
         }
     });
 
+    // ── Agent Protocol v1 ────────────────────────────────────────────────────
+    // Implements HTTP Agent Protocol v1 so orchestrator-mcp-agent can call curator
+    // as a first-class HTTP agent via AgentClient / AgentPool.
+
+    const AGENT_VERSION = '0.2.0';
+
+    // Lightweight in-process task store for async v1 tasks
+    const v1Tasks = new Map<string, {
+        status:      'pending' | 'running' | 'done' | 'failed' | 'cancelled';
+        output?:     unknown;
+        error?:      string;
+        startedAt:   string;
+        finishedAt?: string;
+        durationMs?: number;
+    }>();
+
+    const v1ok = <T>(data: T, meta: Record<string, unknown> = {}) =>
+        ({ ok: true, data, error: null, meta: { agentVersion: AGENT_VERSION, ...meta } });
+
+    const v1err = (code: string, message: string, status = 400) =>
+        [{ ok: false, data: null, error: { code, message }, meta: { agentVersion: AGENT_VERSION } }, status] as const;
+
+    /**
+     * GET /v1/agent/health
+     */
+    router.get('/v1/agent/health', (_req: Request, res: Response) => {
+        res.json(v1ok({ status: 'ok', uptime: process.uptime() }));
+    });
+
+    /**
+     * GET /v1/agent/info
+     */
+    router.get('/v1/agent/info', (_req: Request, res: Response) => {
+        res.json(v1ok({
+            name:        'curator-codex-agent',
+            version:     AGENT_VERSION,
+            description: 'Knowledge curation and RAG search over Obsidian-style vaults',
+            capabilities: [
+                {
+                    name:        'execute',
+                    description: 'Run a knowledge task: searches vault using prior_results context',
+                    async:       false,
+                    input:       { task: 'string', flow_input: 'object?', prior_results: 'array?' },
+                    output:      'string',
+                },
+                {
+                    name:        'search',
+                    description: 'Semantic search across a vault',
+                    async:       false,
+                    input:       { query: 'string', vault_path: 'string?', topK: 'number?' },
+                    output:      'object',
+                },
+                {
+                    name:        'reindex',
+                    description: 'Rebuild the vault search index',
+                    async:       true,
+                    input:       { vault_path: 'string?' },
+                    output:      'object',
+                },
+            ],
+        }, { agentVersion: AGENT_VERSION }));
+    });
+
+    /**
+     * POST /v1/agent/run
+     * Dispatches to: execute | search | reindex
+     */
+    router.post('/v1/agent/run', async (req: Request, res: Response) => {
+        const start      = Date.now();
+        const { capability, input = {}, async: runAsync = false } = req.body as {
+            capability?: string;
+            input?:      Record<string, unknown>;
+            async?:      boolean;
+        };
+
+        if (!capability) {
+            const [body, status] = v1err('INVALID_INPUT', "Missing 'capability' field");
+            return res.status(status).json(body);
+        }
+
+        const meta = () => ({ agentVersion: AGENT_VERSION, durationMs: Date.now() - start });
+
+        try {
+            switch (capability) {
+
+                case 'execute': {
+                    const task        = String(input.task ?? '');
+                    const flowInput   = (input.flow_input  ?? {}) as Record<string, unknown>;
+                    const priorRes    = (input.prior_results ?? []) as Array<{ step: string; agent: string; output: string }>;
+                    const vaultPath   = String(input.vault_path ?? flowInput.vault_path ?? configManager.getOutputPath());
+
+                    // Extract search query: try to parse JSON output from prior classify step
+                    let query = String(flowInput.question ?? flowInput.query ?? task);
+                    for (const r of [...priorRes].reverse()) {
+                        try {
+                            const parsed = JSON.parse(r.output) as Record<string, unknown>;
+                            if (typeof parsed.query === 'string' && parsed.query) { query = parsed.query; break; }
+                        } catch { /* not JSON, use as-is */ }
+                        // Fallback: treat raw string as query
+                        if (r.output && typeof r.output === 'string' && r.output.length < 200) {
+                            query = r.output;
+                            break;
+                        }
+                    }
+
+                    const engine  = await getEngine(vaultPath);
+                    const result  = await engine.search(query, { topK: 5, autoSynthesize: false });
+
+                    if (!result.results || result.results.length === 0) {
+                        return res.json(v1ok({ status: 'done', output: `No knowledge found for: "${query}"` }, meta()));
+                    }
+
+                    const text = result.results
+                        .map((r: { title: string; content: string }, i: number) =>
+                            `### [${i + 1}] ${r.title}\n${r.content.slice(0, 500)}`)
+                        .join('\n\n');
+
+                    return res.json(v1ok({ status: 'done', output: text }, meta()));
+                }
+
+                case 'search': {
+                    const query     = String(input.query ?? input.task ?? '');
+                    const vaultPath = String(input.vault_path ?? input.vaultPath ?? configManager.getOutputPath());
+                    const topK      = Number(input.topK ?? input.top_k ?? 5);
+
+                    if (!query) {
+                        const [body, status] = v1err('INVALID_INPUT', "'query' is required for search capability");
+                        return res.status(status).json(body);
+                    }
+
+                    const engine = await getEngine(vaultPath);
+                    const result = await engine.search(query, { topK, autoSynthesize: false });
+                    return res.json(v1ok({ status: 'done', output: result }, meta()));
+                }
+
+                case 'reindex': {
+                    const vaultPath = String(input.vault_path ?? input.vaultPath ?? configManager.getOutputPath());
+
+                    if (!runAsync) {
+                        const engine = engineCache.get(vaultPath) ?? new KnowledgeEngine(createProvider(), vaultPath);
+                        const result = await engine.reload();
+                        engineCache.set(vaultPath, engine);
+                        return res.json(v1ok({ status: 'done', output: result }, meta()));
+                    }
+
+                    // Async path
+                    const taskId = crypto.randomUUID();
+                    const now    = new Date().toISOString();
+                    v1Tasks.set(taskId, { status: 'pending', startedAt: now });
+                    res.json(v1ok({ status: 'running', taskId }, { agentVersion: AGENT_VERSION }));
+
+                    setImmediate(async () => {
+                        v1Tasks.get(taskId)!.status = 'running';
+                        try {
+                            const engine = engineCache.get(vaultPath) ?? new KnowledgeEngine(createProvider(), vaultPath);
+                            const result = await engine.reload();
+                            engineCache.set(vaultPath, engine);
+                            const t = v1Tasks.get(taskId)!;
+                            t.status     = 'done';
+                            t.output     = result;
+                            t.finishedAt = new Date().toISOString();
+                            t.durationMs = Date.now() - start;
+                        } catch (err) {
+                            const t = v1Tasks.get(taskId)!;
+                            t.status     = 'failed';
+                            t.error      = (err as Error).message;
+                            t.finishedAt = new Date().toISOString();
+                        }
+                    });
+                    return;
+                }
+
+                default: {
+                    const [body, status] = v1err('CAPABILITY_NOT_FOUND', `Capability '${capability}' not found`);
+                    return res.status(status).json(body);
+                }
+            }
+        } catch (err) {
+            const [body] = v1err('EXECUTION_FAILED', (err as Error).message);
+            return res.status(500).json({ ...body, error: { code: 'EXECUTION_FAILED', message: (err as Error).message } });
+        }
+    });
+
+    /**
+     * GET /v1/agent/tasks/:id
+     */
+    router.get('/v1/agent/tasks/:id', (req: Request, res: Response) => {
+        const task = v1Tasks.get(req.params.id);
+        if (!task) {
+            const [body] = v1err('TASK_NOT_FOUND', `Task '${req.params.id}' not found`);
+            return res.status(404).json(body);
+        }
+        res.json(v1ok({ taskId: req.params.id, ...task }));
+    });
+
+    /**
+     * DELETE /v1/agent/tasks/:id
+     */
+    router.delete('/v1/agent/tasks/:id', (req: Request, res: Response) => {
+        const task = v1Tasks.get(req.params.id);
+        if (!task) {
+            const [body] = v1err('TASK_NOT_FOUND', `Task '${req.params.id}' not found`);
+            return res.status(404).json(body);
+        }
+        task.status = 'cancelled';
+        res.json(v1ok({ taskId: req.params.id, status: 'cancelled' }));
+    });
+
     // ── Error Handler ────────────────────────────────────────────────────────
 
     router.use((req: Request, res: Response) => {
@@ -377,6 +586,10 @@ export function createRoutes(configManager: ConfigManager): Router {
                 'POST /curator/file',
                 'POST /knowledge/search',
                 'POST /knowledge/reindex',
+                'GET  /v1/agent/health',
+                'GET  /v1/agent/info',
+                'POST /v1/agent/run',
+                'GET  /v1/agent/tasks/:id',
             ],
         });
     });

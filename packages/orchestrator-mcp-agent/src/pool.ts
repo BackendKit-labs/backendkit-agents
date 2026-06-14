@@ -1,4 +1,4 @@
-import { AgentClient } from '@backendkit-labs/agent-protocol';
+import { AgentClient, CircuitBreakerState } from '@backendkit-labs/agent-protocol';
 import type { AgentInfo, AgentContext, RunOptions } from '@backendkit-labs/agent-protocol';
 import type { PoolStrategy } from './config.js';
 
@@ -32,7 +32,7 @@ export class AgentPool {
     }
 
     private availableClients(): AgentClient[] {
-        return this.clients.filter(c => c.getCircuitState() !== 'OPEN');
+        return this.clients.filter(c => c.getCircuitState() !== CircuitBreakerState.OPEN);
     }
 
     private pickRoundRobin(available: AgentClient[]): AgentClient {
