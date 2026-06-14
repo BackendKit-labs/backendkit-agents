@@ -18,8 +18,8 @@
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
-    "@backendkit-labs/agent-protocol": "^0.1.0",
     "@backendkit-labs/agent-enterprise": "^0.4.0",
+    "@backendkit-labs/agent-protocol": "^0.2.0",
     "@modelcontextprotocol/sdk": "^1.12.0",
     "yaml": "^2.4.0",
     "zod": "^3.25.0"
@@ -33,7 +33,11 @@
     "url": "git+https://github.com/BackendKit-labs/backendkit-agents.git",
     "directory": "packages/orchestrator-mcp-agent"
   },
-  "publishConfig": { "access": "public" },
+  "publishConfig": {
+    "access": "public"
+  },
   "license": "MIT",
-  "engines": { "node": ">=20.0.0" }
+  "engines": {
+    "node": ">=20.0.0"
+  }
 }
