@@ -157,8 +157,8 @@ function createMcpServer(knowledgeEngine: KnowledgeEngine, configManager: Config
                 result.docFiles = files.filter(f => f.relativePath.match(/\.(md|txt)$/)).length;
 
                 const analyzer = makeAnalyzer();
-                // Process files in parallel (batches of 3) for better performance
-                const batchSize = 3;
+                // Process files in parallel (batches of 10) for better performance
+                const batchSize = 10;
                 for (let i = 0; i < files.length; i += batchSize) {
                     const batch = files.slice(i, i + batchSize);
                     const promises = batch.map(file =>
