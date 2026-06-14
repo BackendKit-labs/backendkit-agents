@@ -24,19 +24,18 @@ import { z } from 'zod';
 import * as path from 'node:path';
 import * as fs   from 'node:fs';
 import * as http from 'node:http';
-import {
-    ObsidianRAGProvider,
-    SimpleEmbedder,
-    OllamaEmbedder,
-} from '@backendkit-labs/agent-enterprise';
-import { loadConfig, type OrchestratorConfig } from './config.js';
-import { TaskPlanner }                           from './planner.js';
-import { PlanExecutor, type ExecutionResult, type ActiveRule, ruleToGateCriteria } from './executor.js';
-import { OpenAICompatibleProvider, callLLM }     from './provider.js';
-import { RunStore, type RunState }               from './run-store.js';
-import { matchFlow, flowToTaskPlan }             from './static-flow.js';
-import { VaultWriter }                           from '@backendkit-labs/agent-enterprise';
-import type { ReflectionAdapter }                from './executor.js';
+import IORedis                                     from 'ioredis';
+import { VaultWriter }                            from '@backendkit-labs/agent-enterprise';
+import { loadConfig, resolveDataDir, type OrchestratorConfig } from './config.js';
+import { TaskPlanner }                            from './planner.js';
+import { PlanExecutor, executeSubtask, type ExecutionResult, type ActiveRule, ruleToGateCriteria } from './executor.js';
+import { OpenAICompatibleProvider, callLLM }      from './provider.js';
+import { RunStore, type RunState, type IRunStore } from './run-store.js';
+import { RedisRunStore, redisPrefix }             from './run-store-redis.js';
+import { SubtaskQueue }                           from './subtask-queue.js';
+import { buildRAG }                               from './rag.js';
+import { matchFlow, flowToTaskPlan }              from './static-flow.js';
+import type { ReflectionAdapter }                 from './executor.js';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -44,33 +43,40 @@ const ok  = (text: string) => ({ content: [{ type: 'text' as const, text }] });
 const ts  = () => new Date().toISOString();
 
 // ── Data directory + RunStore ─────────────────────────────────────────────────
-// Data lives adjacent to the config file, NOT in ~/.bk-agent (that belongs to
-// the coding agent). Override with ORCHESTRATOR_DATA_DIR env var (Docker/CI)
-// or data_dir key in orchestrator.yaml.
+// Data lives adjacent to the config file (resolveDataDir from config.ts).
+// When ORCHESTRATOR_REDIS_URL is set, state goes to Redis (RedisRunStore) and
+// subtasks are dispatched via BullMQ queues consumed by orchestrator-worker processes.
 
-function resolveDataDir(configPath: string, config?: OrchestratorConfig): string {
-    if (process.env['ORCHESTRATOR_DATA_DIR']) return process.env['ORCHESTRATOR_DATA_DIR'];
-    if (config?.orchestrator.data_dir) {
-        return path.resolve(path.dirname(path.resolve(configPath)), config.orchestrator.data_dir);
+// Cache the init Promise per config path — avoids duplicate init on concurrent first calls.
+const storeInitCache = new Map<string, Promise<IRunStore>>();
+
+function getStore(configPath: string, config?: OrchestratorConfig): Promise<IRunStore> {
+    const key = path.resolve(configPath);
+    let p = storeInitCache.get(key);
+    if (!p) {
+        p = initStore(key, config);
+        storeInitCache.set(key, p);
     }
-    return path.join(path.dirname(path.resolve(configPath)), '.orchestrator');
+    return p;
 }
 
-const storeCache = new Map<string, RunStore>();
+async function initStore(key: string, config?: OrchestratorConfig): Promise<IRunStore> {
+    let store: IRunStore;
 
-function getStore(configPath: string, config?: OrchestratorConfig): RunStore {
-    const key = path.resolve(configPath);
-    if (storeCache.has(key)) return storeCache.get(key)!;
+    const redisUrl = process.env['ORCHESTRATOR_REDIS_URL'];
+    if (redisUrl) {
+        const redis = new IORedis(redisUrl, { maxRetriesPerRequest: null });
+        store = new RedisRunStore(redis, redisPrefix(key));
+        process.stderr.write(`[orchestrator-agent] RunStore → Redis (${redisUrl.replace(/:\/\/[^@]*@/, '://**:**@')})\n`);
+    } else {
+        store = new RunStore(path.join(resolveDataDir(key, config), 'runs'));
+    }
 
-    const store = new RunStore(path.join(resolveDataDir(key, config), 'runs'));
-    storeCache.set(key, store);
-
-    // Recovery: runs stuck in 'running' when server last crashed won't resume on
-    // their own. Mark them failed. waiting_gate runs are left untouched — they
-    // survive restarts because orchestrator_approve resumes from disk state.
-    const interrupted = store.list().filter(r => r.status === 'running');
+    // Recovery: mark running → failed on startup.
+    // waiting_gate runs survive — orchestrator_approve resumes from persisted state.
+    const interrupted = (await store.list()).filter(r => r.status === 'running');
     for (const run of interrupted) {
-        store.save({
+        await store.save({
             ...run,
             status:      'failed',
             completedAt: new Date().toISOString(),
@@ -81,12 +87,23 @@ function getStore(configPath: string, config?: OrchestratorConfig): RunStore {
         process.stderr.write(`[orchestrator-agent] Marked ${interrupted.length} interrupted run(s) as failed\n`);
     }
 
-    const pruned = store.prune(30);
+    const pruned = await store.prune(30);
     if (pruned > 0) {
         process.stderr.write(`[orchestrator-agent] Pruned ${pruned} old run file(s)\n`);
     }
 
     return store;
+}
+
+// ── BullMQ subtask queue (activated by ORCHESTRATOR_REDIS_URL) ────────────────
+
+let subtaskQueue: SubtaskQueue | undefined;
+
+function getSubtaskQueue(): SubtaskQueue | undefined {
+    const redisUrl = process.env['ORCHESTRATOR_REDIS_URL'];
+    if (!redisUrl) return undefined;
+    if (!subtaskQueue) subtaskQueue = new SubtaskQueue(redisUrl);
+    return subtaskQueue;
 }
 
 // ── Enterprise reflection (Cable 1 + 2) ──────────────────────────────────────

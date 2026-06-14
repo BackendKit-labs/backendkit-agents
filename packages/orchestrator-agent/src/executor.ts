@@ -72,6 +72,12 @@ export interface ExecutorOptions {
     onProgress?:  (msg: string) => void;
     /** Enterprise reflection adapter for deterministic rule enforcement (Cable 2). */
     reflection?:  ReflectionAdapter;
+    /**
+     * When set, subtasks are dispatched via BullMQ instead of executed inline.
+     * The function enqueues the job and returns a Promise that resolves when the
+     * worker completes it (including success/failure and duration).
+     */
+    dispatchFn?:  (subtask: SubTask, priorResults: ExecutionResult[]) => Promise<ExecutionResult>;
 }
 
 // ── Executor ──────────────────────────────────────────────────────────────────
@@ -81,12 +87,14 @@ export class PlanExecutor {
     private readonly ragSearchFn: ((q: string) => Promise<string>) | undefined;
     private readonly onProgress:  (msg: string) => void;
     private readonly reflection:  ReflectionAdapter | undefined;
+    private readonly dispatchFn:  ((subtask: SubTask, priorResults: ExecutionResult[]) => Promise<ExecutionResult>) | undefined;
 
     constructor(opts: ExecutorOptions) {
         this.config      = opts.config;
         this.ragSearchFn = opts.ragSearchFn;
         this.onProgress  = opts.onProgress ?? (() => {});
         this.reflection  = opts.reflection;
+        this.dispatchFn  = opts.dispatchFn;
     }
 
     /**
@@ -189,64 +197,35 @@ export class PlanExecutor {
         const agentCfg = this.config.agents.find(a => a.id === subtask.agent_id);
         this.onProgress(`  → [${subtask.id}] ${agentCfg?.name ?? subtask.agent_id}: ${subtask.task.slice(0, 80)}…`);
 
+        // BullMQ dispatch: delegate to worker process via Redis queue
+        if (this.dispatchFn) {
+            return this.dispatchFn(subtask, priorResults);
+        }
+
         const start = Date.now();
         try {
             const result = agentCfg
-                ? await this.runSpecialist(agentCfg, subtask, priorResults)
+                ? await executeSubtask(this.config, agentCfg, subtask, priorResults, this.ragSearchFn)
                 : `No agent configured for id: ${subtask.agent_id}`;
 
             return {
-                subtask_id: subtask.id,
-                agent_id:   subtask.agent_id,
-                task:       subtask.task,
+                subtask_id:  subtask.id,
+                agent_id:    subtask.agent_id,
+                task:        subtask.task,
                 result,
-                success:    true,
+                success:     true,
                 duration_ms: Date.now() - start,
             };
         } catch (err) {
             return {
-                subtask_id: subtask.id,
-                agent_id:   subtask.agent_id,
-                task:       subtask.task,
-                result:     `Error: ${err instanceof Error ? err.message : String(err)}`,
-                success:    false,
+                subtask_id:  subtask.id,
+                agent_id:    subtask.agent_id,
+                task:        subtask.task,
+                result:      `Error: ${err instanceof Error ? err.message : String(err)}`,
+                success:     false,
                 duration_ms: Date.now() - start,
             };
         }
-    }
-
-    private async runSpecialist(
-        agentCfg: AgentConfig,
-        subtask: SubTask,
-        priorResults: ExecutionResult[],
-    ): Promise<string> {
-        const providerCfg = this.config.providers[agentCfg.provider];
-        if (!providerCfg) {
-            throw new Error(`Provider "${agentCfg.provider}" not configured for agent "${agentCfg.id}"`);
-        }
-
-        const provider = new OpenAICompatibleProvider(providerCfg);
-
-        // Build vault context for this specialist
-        let vaultContext = '';
-        if (this.ragSearchFn) {
-            try { vaultContext = await this.ragSearchFn(subtask.task); } catch { /* vault optional */ }
-        }
-
-        // Include relevant prior results as context
-        const priorContext = priorResults.length > 0
-            ? '\n\nContext from previous steps:\n' +
-              priorResults.map(r => `[${r.agent_id}] ${r.task}\n→ ${r.result.slice(0, 300)}`).join('\n\n')
-            : '';
-
-        const systemPrompt = agentCfg.system_prompt ?? buildSpecialistPrompt(agentCfg);
-        const userPrompt   = [
-            subtask.task,
-            vaultContext ? `\nRelevant knowledge:\n${vaultContext}` : '',
-            priorContext,
-        ].filter(Boolean).join('\n');
-
-        return callLLM(provider, systemPrompt, userPrompt);
     }
 
     /**
@@ -295,6 +274,46 @@ export class PlanExecutor {
         }
         return lines.join('\n');
     }
+}
+
+// ── Standalone subtask executor (used by both inline executor and workers) ────
+
+/**
+ * Calls the LLM for a single specialist subtask.
+ * Extracted so BullMQ workers can call it without instantiating PlanExecutor.
+ */
+export async function executeSubtask(
+    config:       OrchestratorConfig,
+    agentCfg:     AgentConfig,
+    subtask:      SubTask,
+    priorResults: ExecutionResult[],
+    ragSearchFn?: (q: string) => Promise<string>,
+): Promise<string> {
+    const providerCfg = config.providers[agentCfg.provider];
+    if (!providerCfg) {
+        throw new Error(`Provider "${agentCfg.provider}" not configured for agent "${agentCfg.id}"`);
+    }
+
+    const provider = new OpenAICompatibleProvider(providerCfg);
+
+    let vaultContext = '';
+    if (ragSearchFn) {
+        try { vaultContext = await ragSearchFn(subtask.task); } catch { /* vault optional */ }
+    }
+
+    const priorContext = priorResults.length > 0
+        ? '\n\nContext from previous steps:\n' +
+          priorResults.map(r => `[${r.agent_id}] ${r.task}\n→ ${r.result.slice(0, 300)}`).join('\n\n')
+        : '';
+
+    const systemPrompt = agentCfg.system_prompt ?? buildSpecialistPrompt(agentCfg);
+    const userPrompt   = [
+        subtask.task,
+        vaultContext ? `\nRelevant knowledge:\n${vaultContext}` : '',
+        priorContext,
+    ].filter(Boolean).join('\n');
+
+    return callLLM(provider, systemPrompt, userPrompt);
 }
 
 // ── Rule matching helpers (Cable 2) ───────────────────────────────────────────
@@ -387,7 +406,7 @@ export function buildOrchestratorEngine(
                 return `No agent with id "${agent_id}". Available: ${config.agents.map(a => a.id).join(', ')}`;
             }
             onProgress?.(`  → delegating to ${agentCfg.name}…`);
-            return executor['runSpecialist'](agentCfg, { id: 'x', agent_id, task, depends_on: [] }, []);
+            return executeSubtask(config, agentCfg, { id: 'x', agent_id, task, depends_on: [] }, [], ragSearchFn);
         },
     });
 

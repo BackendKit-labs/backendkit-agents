@@ -157,16 +157,25 @@ function createMcpServer(knowledgeEngine: KnowledgeEngine, configManager: Config
                 result.docFiles = files.filter(f => f.relativePath.match(/\.(md|txt)$/)).length;
 
                 const analyzer = makeAnalyzer();
-                for (const file of files) {
-                    try {
-                        const analyzed = await analyzer.analyzeFile(file.fullPath, file.relativePath, files);
+                // Process files in parallel (batches of 3) for better performance
+                const batchSize = 3;
+                for (let i = 0; i < files.length; i += batchSize) {
+                    const batch = files.slice(i, i + batchSize);
+                    const promises = batch.map(file =>
+                        analyzer.analyzeFile(file.fullPath, file.relativePath, files).catch(err => ({
+                            notesWritten: [],
+                            notesSkipped: [],
+                            errors: [`${file.relativePath}: ${(err as Error).message}`],
+                            filesAnalyzed: [],
+                        }))
+                    );
+                    const results = await Promise.all(promises);
+                    results.forEach(analyzed => {
                         result.notesWritten.push(...analyzed.notesWritten);
                         result.notesSkipped.push(...analyzed.notesSkipped);
                         result.errors.push(...analyzed.errors);
                         result.filesAnalyzed.push(...(analyzed.filesAnalyzed || []));
-                    } catch (err) {
-                        result.errors.push(`${file.relativePath}: ${(err as Error).message}`);
-                    }
+                    });
                 }
             } catch (err) {
                 result.errors.push(`Failed to read directory: ${(err as Error).message}`);
