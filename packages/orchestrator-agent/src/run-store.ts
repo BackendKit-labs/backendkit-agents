@@ -1,6 +1,5 @@
 import * as fs   from 'node:fs';
 import * as path from 'node:path';
-import * as os   from 'node:os';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -16,13 +15,12 @@ export interface StepResult {
 }
 
 export interface GatePending {
-    gateId:          string;   // same as stepId — one gate per step
+    gateId:          string;
     stepId:          string;
     agentId:         string;
-    output:          string;   // agent output shown to the human approver
+    output:          string;
     criteria:        string[];
     requestedAt:     string;
-    /** IDs of policyRules that triggered this gate automatically (Cable 2). */
     appliedRuleIds?: string[];
 }
 
@@ -34,23 +32,31 @@ export interface RunState {
     startedAt:       string;
     updatedAt:       string;
     completedAt?:    string;
-    plan?:           unknown;            // TaskPlan — stored for resume
+    plan?:           unknown;
     completedSteps:  StepResult[];
     currentStep?:    { stepId: string; agentId: string; startedAt: string };
     waitingGate?:    GatePending;
-    vaultNotePath?:  string;            // path of the vault note written on completion
+    vaultNotePath?:  string;
     finalReport?:    string;
     error?:          string;
 }
 
-// ── RunStore ──────────────────────────────────────────────────────────────────
+// ── Interface (implemented by both DiskRunStore and RedisRunStore) ─────────────
 
-const DEFAULT_DIR = path.join(os.homedir(), '.bk-agent', 'orchestrator', 'runs');
+export interface IRunStore {
+    newRunId(): string;
+    save(state: RunState): Promise<void>;
+    load(runId: string): Promise<RunState | null>;
+    list(): Promise<RunState[]>;
+    prune(maxAgeDays?: number): Promise<number>;
+}
 
-export class RunStore {
+// ── Disk-based implementation ─────────────────────────────────────────────────
+
+export class RunStore implements IRunStore {
     private readonly dir: string;
 
-    constructor(dir = DEFAULT_DIR) {
+    constructor(dir: string) {
         this.dir = dir;
         fs.mkdirSync(this.dir, { recursive: true });
     }
@@ -59,7 +65,7 @@ export class RunStore {
         return `run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     }
 
-    save(state: RunState): void {
+    async save(state: RunState): Promise<void> {
         const updated: RunState = { ...state, updatedAt: new Date().toISOString() };
         fs.writeFileSync(
             path.join(this.dir, `${state.runId}.json`),
@@ -68,7 +74,7 @@ export class RunStore {
         );
     }
 
-    load(runId: string): RunState | null {
+    async load(runId: string): Promise<RunState | null> {
         try {
             return JSON.parse(
                 fs.readFileSync(path.join(this.dir, `${runId}.json`), 'utf-8'),
@@ -78,11 +84,7 @@ export class RunStore {
         }
     }
 
-    /**
-     * Lists all persisted runs, sorted by startedAt descending (most recent first).
-     * Silently skips unreadable files.
-     */
-    list(): RunState[] {
+    async list(): Promise<RunState[]> {
         let files: string[];
         try {
             files = fs.readdirSync(this.dir).filter(f => f.endsWith('.json'));
@@ -103,17 +105,12 @@ export class RunStore {
         );
     }
 
-    /**
-     * Removes run files older than `maxAgeDays` days that are in a terminal state
-     * (complete or failed). Leaves running/waiting_gate runs untouched.
-     */
-    prune(maxAgeDays = 30): number {
+    async prune(maxAgeDays = 30): Promise<number> {
         const cutoff = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
         let removed = 0;
-        for (const run of this.list()) {
+        for (const run of await this.list()) {
             if (run.status !== 'complete' && run.status !== 'failed') continue;
-            const age = new Date(run.startedAt).getTime();
-            if (age < cutoff) {
+            if (new Date(run.startedAt).getTime() < cutoff) {
                 try {
                     fs.unlinkSync(path.join(this.dir, `${run.runId}.json`));
                     removed++;

@@ -107,3 +107,15 @@ function expandEnv(obj: unknown): unknown {
 export function resolveProviderConfig(config: OrchestratorConfig, providerId: string): ProviderConfig | null {
     return config.providers[providerId] ?? null;
 }
+
+/**
+ * Resolves where orchestrator data (runs, RAG index) should be stored.
+ * Priority: ORCHESTRATOR_DATA_DIR env > data_dir in YAML > .orchestrator/ adjacent to config file.
+ */
+export function resolveDataDir(configPath: string, config?: OrchestratorConfig): string {
+    if (process.env['ORCHESTRATOR_DATA_DIR']) return process.env['ORCHESTRATOR_DATA_DIR'];
+    if (config?.orchestrator.data_dir) {
+        return path.resolve(path.dirname(path.resolve(configPath)), config.orchestrator.data_dir);
+    }
+    return path.join(path.dirname(path.resolve(configPath)), '.orchestrator');
+}

@@ -43,6 +43,7 @@ import { CodeAnalyzer }                  from './analyzer.js';
 import { KnowledgeEngine }               from './knowledge/engine.js';
 import { createProvider }                from './providers/index.js';
 import { findAllFiles }                  from './checksum.js';
+import { ConfigManager }                 from './api/config.js';
 
 // ── Configuration ────────────────────────────────────────────────────────────
 
@@ -52,6 +53,7 @@ const HTTP_PORT    = process.env.CURATOR_HTTP_PORT ? parseInt(process.env.CURATO
 const ENABLE_HTTP   = HTTP_PORT !== null;
 
 let knowledgeEngine: KnowledgeEngine;
+let configManager: ConfigManager;
 
 if (!API_KEY)    { console.error('[codex] ✗ CURATOR_API_KEY is required'); process.exit(1); }
 if (!VAULT_PATH) { console.error('[codex] ✗ CURATOR_OUTPUT_PATH is required'); process.exit(1); }
@@ -69,7 +71,7 @@ function makeAnalyzer(): CodeAnalyzer {
 // Creates a fresh MCP server with all tools registered.
 // Called once for stdio, once per HTTP request (stateless).
 
-function createMcpServer(knowledgeEngine: KnowledgeEngine): McpServer {
+function createMcpServer(knowledgeEngine: KnowledgeEngine, configManager: ConfigManager): McpServer {
     const srv = new McpServer({ name: 'curator-codex-agent', version: '0.2.0' });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const t = srv.tool.bind(srv) as any;
@@ -116,11 +118,12 @@ function createMcpServer(knowledgeEngine: KnowledgeEngine): McpServer {
         'curator_process_directory',
         'Recursively analyze all code and documentation files in a directory. ' +
         'Intelligently discovers associated documentation (.md files) and combines them with code analysis. ' +
-        'Uses manifest tracking to skip unchanged files on subsequent runs.',
+        'Uses manifest tracking to skip unchanged files on subsequent runs. ' +
+        'If directory_path is omitted, uses the inputPath from the active workspace.',
         {
-            directory_path: z.string().describe('Absolute path to the directory'),
+            directory_path: z.string().optional().describe('Absolute path to the directory. If omitted, uses active workspace inputPath.'),
         },
-        async ({ directory_path }: { directory_path: string }) => {
+        async ({ directory_path }: { directory_path?: string }) => {
             const start = Date.now();
             const result = {
                 notesWritten: [] as string[],
@@ -134,7 +137,15 @@ function createMcpServer(knowledgeEngine: KnowledgeEngine): McpServer {
             };
 
             try {
-                const files = await findAllFiles(directory_path);
+                // Use provided path or fall back to workspace inputPath
+                const targetPath = directory_path || configManager.getInputPath();
+                if (!targetPath) {
+                    result.errors.push('No directory path provided and workspace inputPath not configured');
+                    result.durationMs = Date.now() - start;
+                    return { content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
+                }
+
+                const files = await findAllFiles(targetPath);
                 if (files.length === 0) {
                     result.errors.push('No code or documentation files found');
                     result.durationMs = Date.now() - start;
@@ -538,8 +549,8 @@ function createMcpServer(knowledgeEngine: KnowledgeEngine): McpServer {
 
 // ── Stdio Transport ──────────────────────────────────────────────────────────
 
-async function startStdio(): Promise<void> {
-    const srv       = createMcpServer(knowledgeEngine);
+async function startStdio(cfg: ConfigManager): Promise<void> {
+    const srv       = createMcpServer(knowledgeEngine, cfg);
     const transport = new StdioServerTransport();
     await srv.connect(transport);
     log('✓ Stdio MCP transport ready');
@@ -547,7 +558,7 @@ async function startStdio(): Promise<void> {
 
 // ── HTTP Transport ──────────────────────────────────────────────────────────
 
-async function startHttp(port: number): Promise<void> {
+async function startHttp(port: number, cfg: ConfigManager): Promise<void> {
     const server = http.createServer(async (req, res) => {
         if (req.method !== 'POST' || req.url !== '/mcp') {
             res.writeHead(404, { 'Content-Type': 'application/json' });
@@ -570,7 +581,7 @@ async function startHttp(port: number): Promise<void> {
         }
 
         try {
-            const srv       = createMcpServer(knowledgeEngine);
+            const srv       = createMcpServer(knowledgeEngine, cfg);
             const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
             await srv.connect(transport);
             await transport.handleRequest(req, res, body);
@@ -599,6 +610,14 @@ async function main(): Promise<void> {
     log(`Vault:     ${VAULT_PATH}`);
     log(`Model:     ${process.env.CURATOR_MODEL || 'deepseek-reasoner'}`);
 
+    // Initialize Configuration Manager
+    try {
+        configManager = new ConfigManager();
+    } catch (err) {
+        log(`⚠ ConfigManager initialization failed: ${(err as Error).message}`);
+        configManager = new ConfigManager({ outputPath: VAULT_PATH });
+    }
+
     // Initialize Knowledge Engine
     try {
         log('Initializing knowledge engine...');
@@ -614,7 +633,7 @@ async function main(): Promise<void> {
 
     // Start Stdio (always)
     try {
-        await startStdio();
+        await startStdio(configManager);
     } catch (err) {
         log(`✗ Stdio transport failed: ${(err as Error).message}`);
         process.exit(1);
@@ -623,7 +642,7 @@ async function main(): Promise<void> {
     // Start HTTP (optional)
     if (ENABLE_HTTP) {
         try {
-            await startHttp(HTTP_PORT!);
+            await startHttp(HTTP_PORT!, configManager);
         } catch (err) {
             log(`✗ HTTP transport failed: ${(err as Error).message}`);
             process.exit(1);
