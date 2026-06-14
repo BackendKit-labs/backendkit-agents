@@ -62,14 +62,10 @@ export class FlowExecutor {
         };
 
         const completed = new Map<string, StepResult>(priorResults.map(r => [r.stepId, r]));
-        let resuming    = !!resumeAfter;
 
         for (const step of flow.steps) {
-            // Skip already-completed steps when resuming after a gate
-            if (resumeAfter && step.id !== resumeAfter) {
-                if (!completed.has(step.id)) continue;
-            }
-            if (resuming && step.id === resumeAfter) resuming = false;
+            // Skip any step already completed (including the gate step that triggered the pause)
+            if (resumeAfter && completed.has(step.id)) continue;
 
             // Wait for dependencies
             for (const depId of step.depends_on) {
