@@ -119,70 +119,95 @@ function createMcpServer(knowledgeEngine: KnowledgeEngine, configManager: Config
         'Recursively analyze all code and documentation files in a directory. ' +
         'Intelligently discovers associated documentation (.md files) and combines them with code analysis. ' +
         'Uses manifest tracking to skip unchanged files on subsequent runs. ' +
-        'If directory_path is omitted, uses the inputPath from the active workspace.',
+        'If directory_path is omitted, uses the inputPath from the active workspace. ' +
+        'Processing happens asynchronously in background to avoid timeout.',
         {
             directory_path: z.string().optional().describe('Absolute path to the directory. If omitted, uses active workspace inputPath.'),
         },
         async ({ directory_path }: { directory_path?: string }) => {
-            const start = Date.now();
-            const result = {
-                notesWritten: [] as string[],
-                notesSkipped: [] as string[],
-                errors: [] as string[],
-                filesAnalyzed: [] as string[],
-                totalFiles: 0,
-                codeFiles: 0,
-                docFiles: 0,
-                durationMs: 0,
-            };
-
             try {
                 // Use provided path or fall back to workspace inputPath
                 const targetPath = directory_path || configManager.getInputPath();
                 if (!targetPath) {
-                    result.errors.push('No directory path provided and workspace inputPath not configured');
-                    result.durationMs = Date.now() - start;
-                    return { content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
+                    return {
+                        content: [{
+                            type: 'text' as const,
+                            text: JSON.stringify({
+                                status: 'error',
+                                error: 'No directory path provided and workspace inputPath not configured',
+                            }),
+                        }]
+                    };
                 }
 
                 const files = await findAllFiles(targetPath);
                 if (files.length === 0) {
-                    result.errors.push('No code or documentation files found');
-                    result.durationMs = Date.now() - start;
-                    return { content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
+                    return {
+                        content: [{
+                            type: 'text' as const,
+                            text: JSON.stringify({
+                                status: 'completed',
+                                notesWritten: [],
+                                notesSkipped: [],
+                                errors: ['No code or documentation files found'],
+                                filesAnalyzed: [],
+                                totalFiles: 0,
+                            }),
+                        }]
+                    };
                 }
 
-                result.totalFiles = files.length;
-                result.codeFiles = files.filter(f => f.relativePath.match(/\.(ts|tsx|js|jsx|py|go|rs|java|c|cpp|kt|swift)$/)).length;
-                result.docFiles = files.filter(f => f.relativePath.match(/\.(md|txt)$/)).length;
+                // Return immediately with status
+                const immediateResponse = {
+                    status: 'processing',
+                    message: `Started processing ${files.length} files in background`,
+                    totalFiles: files.length,
+                    codeFiles: files.filter(f => f.relativePath.match(/\.(ts|tsx|js|jsx|py|go|rs|java|c|cpp|kt|swift)$/)).length,
+                    docFiles: files.filter(f => f.relativePath.match(/\.(md|txt)$/)).length,
+                };
 
-                const analyzer = makeAnalyzer();
-                // Process files in parallel (batches of 10) for better performance
-                const batchSize = 10;
-                for (let i = 0; i < files.length; i += batchSize) {
-                    const batch = files.slice(i, i + batchSize);
-                    const promises = batch.map(file =>
-                        analyzer.analyzeFile(file.fullPath, file.relativePath, files).catch(err => ({
-                            notesWritten: [],
-                            notesSkipped: [],
-                            errors: [`${file.relativePath}: ${(err as Error).message}`],
-                            filesAnalyzed: [],
-                        }))
-                    );
-                    const results = await Promise.all(promises);
-                    results.forEach(analyzed => {
-                        result.notesWritten.push(...analyzed.notesWritten);
-                        result.notesSkipped.push(...analyzed.notesSkipped);
-                        result.errors.push(...analyzed.errors);
-                        result.filesAnalyzed.push(...(analyzed.filesAnalyzed || []));
-                    });
-                }
+                // Process in background without awaiting
+                (async () => {
+                    const start = Date.now();
+                    try {
+                        const analyzer = makeAnalyzer();
+                        const batchSize = 10;
+                        for (let i = 0; i < files.length; i += batchSize) {
+                            const batch = files.slice(i, i + batchSize);
+                            const promises = batch.map(file =>
+                                analyzer.analyzeFile(file.fullPath, file.relativePath, files).catch(err => ({
+                                    notesWritten: [],
+                                    notesSkipped: [],
+                                    errors: [`${file.relativePath}: ${(err as Error).message}`],
+                                    filesAnalyzed: [],
+                                }))
+                            );
+                            await Promise.all(promises);
+                        }
+                        const duration = Date.now() - start;
+                        log(`✓ Processed ${files.length} files in ${duration}ms`);
+                    } catch (err) {
+                        log(`✗ Background processing error: ${(err as Error).message}`);
+                    }
+                })();
+
+                return {
+                    content: [{
+                        type: 'text' as const,
+                        text: JSON.stringify(immediateResponse),
+                    }]
+                };
             } catch (err) {
-                result.errors.push(`Failed to read directory: ${(err as Error).message}`);
+                return {
+                    content: [{
+                        type: 'text' as const,
+                        text: JSON.stringify({
+                            status: 'error',
+                            error: (err as Error).message,
+                        }),
+                    }]
+                };
             }
-
-            result.durationMs = Date.now() - start;
-            return { content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
         },
     );
 
