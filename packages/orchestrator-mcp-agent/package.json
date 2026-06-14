@@ -1,0 +1,39 @@
+{
+  "name": "@backendkit-labs/orchestrator-mcp-agent",
+  "version": "0.1.0",
+  "description": "Orchestrator MCP agent — coordinates independent agents via Agent HTTP Protocol v1 with multi-instance pools, gates, and static flows.",
+  "type": "module",
+  "main": "dist/server.js",
+  "bin": {
+    "orchestrator-mcp-agent": "./dist/server.js"
+  },
+  "files": [
+    "dist/",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc --noCheck",
+    "start": "node dist/server.js",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@backendkit-labs/agent-protocol": "^0.1.0",
+    "@backendkit-labs/agent-enterprise": "^0.4.0",
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "yaml": "^2.4.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.12",
+    "typescript": "^5.7.3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BackendKit-labs/backendkit-agents.git",
+    "directory": "packages/orchestrator-mcp-agent"
+  },
+  "publishConfig": { "access": "public" },
+  "license": "MIT",
+  "engines": { "node": ">=20.0.0" }
+}
