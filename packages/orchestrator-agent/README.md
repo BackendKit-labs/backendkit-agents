@@ -9,6 +9,7 @@ Config-driven multi-agent orchestration for enterprise workflows. Decomposes nat
 - **Gates**: pauses for human approval at critical steps, either by config or by active policy rules
 - **Persists**: every run is saved to disk (or Redis) — survives restarts, resumes after gate approval
 - **Learns**: enterprise reflection monitors gate outcomes and promotes recurring failure patterns into deterministic policy rules
+- **Remembers**: completed runs are auto-distilled into the knowledge vault; specialist agents receive episodic context from past successful runs on similar tasks
 
 ## Installation
 
@@ -92,7 +93,9 @@ orchestrator_run
 | **Redis + BullMQ** | Distributed execution across worker processes for production |
 | **HTTP trigger** | REST endpoint for n8n / external system integration |
 | **Enterprise reflection** | MAPE-K: monitors outcomes → promotes patterns → enforces rules |
-| **Vault writer** | Final reports auto-saved to the knowledge vault |
+| **Run consolidation** | Completed runs auto-distilled by LLM into vault — episodic→semantic loop |
+| **Cross-run episodic memory** | Agents receive past successful outputs for similar tasks as context |
+| **Forgetting curve** | Episodic memory prunes by relevance (recency × recall frequency), not just age |
 
 ## MCP Tools
 
@@ -115,8 +118,9 @@ orchestrator_run
 - [Gates and policies](docs/gates-and-policies.md) — human approval, Cable 2 automatic gates
 - [HTTP trigger](docs/http-trigger.md) — REST API for n8n and external systems
 - [Redis + workers](docs/redis-workers.md) — distributed execution with BullMQ
-- [RAG vault](docs/rag-vault.md) — LanceDB incremental indexing, embedder options
+- [RAG vault](docs/rag-vault.md) — LanceDB indexing, run consolidation, cross-run episodic injection
 - [Enterprise reflection](docs/reflection.md) — MAPE-K loop, promotions, demotions
+- [Memory system](docs/memory-system.md) — full architecture: episodic, semantic, procedural, forgetting curve
 
 ## Data directory
 

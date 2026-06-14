@@ -3,7 +3,7 @@ import * as path    from 'node:path';
 import * as lancedb from '@lancedb/lancedb';
 
 // Structural type — SimpleEmbedder and OllamaEmbedder from agent-enterprise both satisfy this.
-type AnyEmbedder = { embed(text: string): Promise<number[]> };
+type AnyEmbedder = { embedOne(text: string): Promise<number[]> };
 
 type ChunkRow = {
     vector:   number[];
@@ -80,7 +80,7 @@ export class LanceRAGProvider {
                 const content = fs.readFileSync(absPath, 'utf-8');
                 const chunks  = chunkMarkdown(content);
                 for (let i = 0; i < chunks.length; i++) {
-                    const vector = await this.opts.embedder.embed(chunks[i]);
+                    const vector = await this.opts.embedder.embedOne(chunks[i]);
                     newRows.push({ vector, text: chunks[i], filePath: relPath, mtime, chunkId: `${relPath}#${i}` });
                 }
                 log(`indexed ${relPath} (${chunks.length} chunks)`);
@@ -129,7 +129,7 @@ export class LanceRAGProvider {
             this.table = await this.db.openTable('chunks');
         }
 
-        const queryVec = await this.opts.embedder.embed(query);
+        const queryVec = await this.opts.embedder.embedOne(query);
 
         let rows: Record<string, unknown>[] = [];
         try {

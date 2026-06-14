@@ -67,17 +67,23 @@ export interface ReflectionAdapter {
 }
 
 export interface ExecutorOptions {
-    config:       OrchestratorConfig;
-    ragSearchFn?: (query: string) => Promise<string>;
-    onProgress?:  (msg: string) => void;
+    config:        OrchestratorConfig;
+    ragSearchFn?:  (query: string) => Promise<string>;
+    onProgress?:   (msg: string) => void;
     /** Enterprise reflection adapter for deterministic rule enforcement (Cable 2). */
-    reflection?:  ReflectionAdapter;
+    reflection?:   ReflectionAdapter;
     /**
      * When set, subtasks are dispatched via BullMQ instead of executed inline.
      * The function enqueues the job and returns a Promise that resolves when the
      * worker completes it (including success/failure and duration).
      */
-    dispatchFn?:  (subtask: SubTask, priorResults: ExecutionResult[]) => Promise<ExecutionResult>;
+    dispatchFn?:   (subtask: SubTask, priorResults: ExecutionResult[]) => Promise<ExecutionResult>;
+    /**
+     * Cross-run episodic memory: returns past successful outputs from the same agent
+     * for similar tasks. Injected into the agent prompt as examples.
+     * Only available in inline mode — BullMQ workers skip this.
+     */
+    episodicFn?:   (agentId: string, task: string) => Promise<string>;
 }
 
 // ── Executor ──────────────────────────────────────────────────────────────────
@@ -88,6 +94,7 @@ export class PlanExecutor {
     private readonly onProgress:  (msg: string) => void;
     private readonly reflection:  ReflectionAdapter | undefined;
     private readonly dispatchFn:  ((subtask: SubTask, priorResults: ExecutionResult[]) => Promise<ExecutionResult>) | undefined;
+    private readonly episodicFn:  ((agentId: string, task: string) => Promise<string>) | undefined;
 
     constructor(opts: ExecutorOptions) {
         this.config      = opts.config;
@@ -95,6 +102,7 @@ export class PlanExecutor {
         this.onProgress  = opts.onProgress ?? (() => {});
         this.reflection  = opts.reflection;
         this.dispatchFn  = opts.dispatchFn;
+        this.episodicFn  = opts.episodicFn;
     }
 
     /**
@@ -205,7 +213,7 @@ export class PlanExecutor {
         const start = Date.now();
         try {
             const result = agentCfg
-                ? await executeSubtask(this.config, agentCfg, subtask, priorResults, this.ragSearchFn)
+                ? await executeSubtask(this.config, agentCfg, subtask, priorResults, this.ragSearchFn, this.episodicFn)
                 : `No agent configured for id: ${subtask.agent_id}`;
 
             return {
@@ -288,6 +296,7 @@ export async function executeSubtask(
     subtask:      SubTask,
     priorResults: ExecutionResult[],
     ragSearchFn?: (q: string) => Promise<string>,
+    episodicFn?:  (agentId: string, task: string) => Promise<string>,
 ): Promise<string> {
     const providerCfg = config.providers[agentCfg.provider];
     if (!providerCfg) {
@@ -301,6 +310,11 @@ export async function executeSubtask(
         try { vaultContext = await ragSearchFn(subtask.task); } catch { /* vault optional */ }
     }
 
+    let episodicContext = '';
+    if (episodicFn) {
+        try { episodicContext = await episodicFn(agentCfg.id, subtask.task); } catch { /* optional */ }
+    }
+
     const priorContext = priorResults.length > 0
         ? '\n\nContext from previous steps:\n' +
           priorResults.map(r => `[${r.agent_id}] ${r.task}\n→ ${r.result.slice(0, 300)}`).join('\n\n')
@@ -309,7 +323,8 @@ export async function executeSubtask(
     const systemPrompt = agentCfg.system_prompt ?? buildSpecialistPrompt(agentCfg);
     const userPrompt   = [
         subtask.task,
-        vaultContext ? `\nRelevant knowledge:\n${vaultContext}` : '',
+        vaultContext    ? `\nRelevant knowledge:\n${vaultContext}` : '',
+        episodicContext,
         priorContext,
     ].filter(Boolean).join('\n');
 

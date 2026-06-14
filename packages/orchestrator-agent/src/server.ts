@@ -35,6 +35,7 @@ import { RedisRunStore, redisPrefix }             from './run-store-redis.js';
 import { SubtaskQueue }                           from './subtask-queue.js';
 import { buildRAG }                               from './rag.js';
 import { matchFlow, flowToTaskPlan }              from './static-flow.js';
+import { consolidateRun }                         from './consolidate.js';
 import type { ReflectionAdapter }                 from './executor.js';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -225,6 +226,48 @@ async function planDynamic(
     }
 }
 
+// ── Cross-run episodic memory ─────────────────────────────────────────────────
+
+/**
+ * Builds an episodic lookup function over the RunStore.
+ * For a given agentId + task text, returns a formatted block of the 2 most
+ * similar successful outputs from past runs — injected into the agent prompt.
+ * Only used in inline mode; BullMQ workers skip it (no shared RunStore access).
+ */
+function buildEpisodicFn(store: IRunStore): (agentId: string, task: string) => Promise<string> {
+    return async (agentId: string, taskText: string): Promise<string> => {
+        let allRuns: RunState[];
+        try { allRuns = await store.list(); } catch { return ''; }
+
+        const steps = allRuns
+            .filter(r => r.status === 'complete')
+            .flatMap(r => r.completedSteps)
+            .filter(s => s.agentId === agentId && s.success && s.output.length > 50);
+
+        if (steps.length === 0) return '';
+
+        const queryTokens = taskText.toLowerCase().split(/\s+/).filter(w => w.length > 3);
+        if (queryTokens.length === 0) return '';
+
+        const scored = steps
+            .map(s => {
+                const text  = (s.task + ' ' + s.output).toLowerCase();
+                const score = queryTokens.filter(w => text.includes(w)).length / queryTokens.length;
+                return { s, score };
+            })
+            .filter(x => x.score >= 0.15)
+            .sort((a, b) => b.score - a.score)
+            .slice(0, 2);
+
+        if (scored.length === 0) return '';
+
+        return '\n\nExamples from past successful runs by this agent:\n' +
+            scored.map(x =>
+                `Task: ${x.s.task}\nResult: ${x.s.output.slice(0, 400)}`,
+            ).join('\n\n');
+    };
+}
+
 // ── Background execution ──────────────────────────────────────────────────────
 
 /**
@@ -254,8 +297,9 @@ async function executeInBackground(
 
     const executor = new PlanExecutor({
         config,
-        ragSearchFn: rag?.search,
+        ragSearchFn:  rag?.search,
         reflection,
+        episodicFn:   queue ? undefined : buildEpisodicFn(store),
         // BullMQ: dispatch via Redis queue so external worker processes execute the step
         dispatchFn: queue
             ? (subtask, pr) => queue.dispatch(subtask, pr, configPath)
@@ -295,16 +339,18 @@ async function executeInBackground(
         } else {
             let vaultNotePath: string | undefined;
             if (config.orchestrator.vault) {
-                try {
-                    const writer = new VaultWriter({ vaultPath: config.orchestrator.vault.path });
-                    vaultNotePath = await writer.writeNote({
-                        title:       `Run ${runId} — ${state.task.slice(0, 60)}`,
-                        content:     result.summary,
-                        agentId:     'orchestrator',
-                        tags:        ['área/orquestador', 'función/resultado'],
-                        description: state.task.slice(0, 120),
-                    });
-                } catch { /* vault write is best-effort */ }
+                const orchProvCfg = config.providers[config.orchestrator.provider];
+                if (orchProvCfg) {
+                    const orchProvider = new OpenAICompatibleProvider(orchProvCfg);
+                    const writer       = new VaultWriter({ vaultPath: config.orchestrator.vault.path });
+                    vaultNotePath = await consolidateRun(
+                        runId,
+                        state.task,
+                        result.results,
+                        (sys, usr) => callLLM(orchProvider, sys, usr),
+                        writer,
+                    );
+                }
             }
 
             await store.save({
