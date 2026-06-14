@@ -161,36 +161,6 @@ async function getReflection(vaultPath: string): Promise<ReflectionFull | undefi
     }
 }
 
-// ── RAG setup ─────────────────────────────────────────────────────────────────
-
-async function buildRAG(config: OrchestratorConfig, dataDir: string): Promise<{
-    search: (q: string) => Promise<string>;
-} | null> {
-    const vaultCfg = config.orchestrator.vault;
-    if (!vaultCfg) return null;
-
-    const indexDir = path.join(dataDir, 'rag');
-    fs.mkdirSync(indexDir, { recursive: true });
-
-    const embedder = vaultCfg.embedder === 'ollama'
-        ? new OllamaEmbedder({ host: vaultCfg.ollama_host, model: vaultCfg.ollama_model })
-        : new SimpleEmbedder();
-
-    const rag = new ObsidianRAGProvider({
-        vaultPath: vaultCfg.path,
-        indexPath: path.join(indexDir, 'vault.json'),
-        embedder,
-        topK:      5,
-        minScore:  0.1,
-    });
-
-    await rag.index({ verbose: false });
-
-    return {
-        search: (query: string) => rag.search(query),
-    };
-}
-
 // ── Planning helpers ──────────────────────────────────────────────────────────
 
 /**
@@ -271,8 +241,8 @@ async function executeInBackground(
     rag:          { search: (q: string) => Promise<string> } | null,
     priorResults: ExecutionResult[] = [],
 ): Promise<void> {
-    const store = getStore(configPath, config);
-    const state = store.load(runId);
+    const store = await getStore(configPath, config);
+    const state = await store.load(runId);
     if (!state) return;
 
     // Cable 1 + 2: wire reflection adapter when vault is configured
@@ -280,17 +250,25 @@ async function executeInBackground(
         ? await getReflection(config.orchestrator.vault.path).catch(() => undefined)
         : undefined;
 
+    const queue = getSubtaskQueue();
+
     const executor = new PlanExecutor({
         config,
         ragSearchFn: rag?.search,
         reflection,
+        // BullMQ: dispatch via Redis queue so external worker processes execute the step
+        dispatchFn: queue
+            ? (subtask, pr) => queue.dispatch(subtask, pr, configPath)
+            : undefined,
         onProgress: (msg) => {
             const match = msg.match(/\[([^\]]+)\]/);
             if (match) {
-                const current = store.load(runId);
-                if (current && current.status === 'running') {
-                    store.save({ ...current, currentStep: { stepId: match[1], agentId: match[1], startedAt: ts() } });
-                }
+                // fire-and-forget: currentStep update is best-effort progress tracking
+                store.load(runId).then(current => {
+                    if (current && current.status === 'running') {
+                        return store.save({ ...current, currentStep: { stepId: match[1], agentId: match[1], startedAt: ts() } });
+                    }
+                }).catch(() => {});
             }
         },
     });
@@ -299,7 +277,7 @@ async function executeInBackground(
         const result = await executor.execute(plan as Parameters<typeof executor.execute>[0], priorResults);
 
         if ('gateRequired' in result) {
-            store.save({
+            await store.save({
                 ...state,
                 status:         'waiting_gate',
                 currentStep:    undefined,
@@ -315,7 +293,6 @@ async function executeInBackground(
                 },
             });
         } else {
-            // Write final report to vault if vault is configured
             let vaultNotePath: string | undefined;
             if (config.orchestrator.vault) {
                 try {
@@ -330,7 +307,7 @@ async function executeInBackground(
                 } catch { /* vault write is best-effort */ }
             }
 
-            store.save({
+            await store.save({
                 ...state,
                 status:         'complete',
                 completedAt:    ts(),
@@ -342,7 +319,7 @@ async function executeInBackground(
             });
         }
     } catch (err) {
-        store.save({
+        await store.save({
             ...state,
             status:      'failed',
             currentStep: undefined,
@@ -386,7 +363,7 @@ async function startRun(
     const reflection = config.orchestrator.vault
         ? await getReflection(config.orchestrator.vault.path).catch(() => undefined)
         : undefined;
-    const store      = getStore(configPath, config);
+    const store      = await getStore(configPath, config);
     const configDir  = path.dirname(path.resolve(configPath));
 
     let plan: import('./planner.js').TaskPlan;
@@ -419,12 +396,12 @@ async function startRun(
     if ('error' in plan) return { error: (plan as { error: string }).error };
 
     const runId = store.newRunId();
-    store.save({ runId, task, configPath, status: 'running', startedAt: ts(), updatedAt: ts(), plan, completedSteps: [] });
+    await store.save({ runId, task, configPath, status: 'running', startedAt: ts(), updatedAt: ts(), plan, completedSteps: [] });
 
     setImmediate(() => {
-        executeInBackground(runId, configPath, config, plan, rag).catch(err => {
-            const s = store.load(runId);
-            if (s) store.save({ ...s, status: 'failed', error: String(err) });
+        executeInBackground(runId, configPath, config, plan, rag).catch(async err => {
+            const s = await store.load(runId);
+            if (s) await store.save({ ...s, status: 'failed', error: String(err) });
         });
     });
 
@@ -500,8 +477,8 @@ srv.tool(
             return ok(`Config error: ${err instanceof Error ? err.message : String(err)}`);
         }
 
-        const store = getStore(config_path, config);
-        const state = store.load(run_id);
+        const store = await getStore(config_path, config);
+        const state = await store.load(run_id);
         if (!state) return ok(`Run not found: ${run_id}`);
         if (state.status !== 'waiting_gate') {
             return ok(`Run \`${run_id}\` is not waiting for a gate (current status: ${state.status})`);
@@ -522,7 +499,7 @@ srv.tool(
         }
 
         if (!approved) {
-            store.save({
+            await store.save({
                 ...state,
                 status:      'failed',
                 completedAt: ts(),
@@ -544,7 +521,7 @@ srv.tool(
             status:     'running',
             waitingGate: undefined,
         };
-        store.save(resumeState);
+        await store.save(resumeState);
 
         const priorResults: ExecutionResult[] = state.completedSteps.map(s => ({
             subtask_id:  s.stepId,
@@ -556,9 +533,9 @@ srv.tool(
         }));
 
         setImmediate(() => {
-            executeInBackground(run_id, config_path, config, state.plan, rag, priorResults).catch((err) => {
-                const s = store.load(run_id);
-                if (s) store.save({ ...s, status: 'failed', error: String(err) });
+            executeInBackground(run_id, config_path, config, state.plan, rag, priorResults).catch(async (err) => {
+                const s = await store.load(run_id);
+                if (s) await store.save({ ...s, status: 'failed', error: String(err) });
             });
         });
 
@@ -624,7 +601,7 @@ srv.tool(
         run_id:      z.string().describe('Run ID returned by orchestrator_run'),
     },
     async ({ config_path, run_id }) => {
-        const state = getStore(config_path).load(run_id);
+        const state = await (await getStore(config_path)).load(run_id);
         if (!state) return ok(`Run not found: ${run_id}`);
 
         const lines: string[] = [
@@ -923,7 +900,7 @@ srv.tool(
             .describe('Maximum number of runs to return (most recent first). Default: 20'),
     },
     async ({ config_path, status, limit }) => {
-        const all  = getStore(config_path).list();
+        const all  = await (await getStore(config_path)).list();
         const runs = (status === 'all' ? all : all.filter(r => r.status === status))
             .slice(0, limit);
 
@@ -1052,7 +1029,7 @@ async function startHttpServer(
                 try { config = loadConfig(configPath); }
                 catch (err) { reply(res, 500, { error: `Config error: ${err instanceof Error ? err.message : String(err)}` }); return; }
 
-                const state = getStore(configPath, config).load(runId);
+                const state = await (await getStore(configPath, config)).load(runId);
                 if (!state) { reply(res, 404, { error: `Run not found: ${runId}` }); return; }
 
                 reply(res, 200, {
@@ -1088,8 +1065,8 @@ async function startHttpServer(
                 try { config = loadConfig(configPath); }
                 catch (err) { reply(res, 500, { error: `Config error: ${err instanceof Error ? err.message : String(err)}` }); return; }
 
-                const store = getStore(configPath, config);
-                const state = store.load(runId);
+                const store = await getStore(configPath, config);
+                const state = await store.load(runId);
                 if (!state)                          { reply(res, 404, { error: `Run not found: ${runId}` }); return; }
                 if (state.status !== 'waiting_gate') { reply(res, 409, { error: `Run not waiting for a gate (status: ${state.status})` }); return; }
 
@@ -1106,7 +1083,7 @@ async function startHttpServer(
                 }
 
                 if (!approved) {
-                    store.save({
+                    await store.save({
                         ...state, status: 'failed', completedAt: ts(),
                         error: `Gate rejected. Step: ${gate.stepId}. Notes: ${notes ?? '(none)'}`,
                         waitingGate: undefined,
@@ -1115,7 +1092,7 @@ async function startHttpServer(
                     return;
                 }
 
-                store.save({ ...state, status: 'running', waitingGate: undefined });
+                await store.save({ ...state, status: 'running', waitingGate: undefined });
 
                 const rag = await buildRAG(config, resolveDataDir(configPath, config)).catch(() => null);
                 const priorResults: ExecutionResult[] = state.completedSteps.map(s => ({
@@ -1124,9 +1101,9 @@ async function startHttpServer(
                 }));
 
                 setImmediate(() => {
-                    executeInBackground(runId, configPath, config, state.plan, rag, priorResults).catch(err => {
-                        const s = store.load(runId);
-                        if (s) store.save({ ...s, status: 'failed', error: String(err) });
+                    executeInBackground(runId, configPath, config, state.plan, rag, priorResults).catch(async err => {
+                        const s = await store.load(runId);
+                        if (s) await store.save({ ...s, status: 'failed', error: String(err) });
                     });
                 });
 
