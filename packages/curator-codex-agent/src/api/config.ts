@@ -110,10 +110,34 @@ export class ConfigManager {
     }
 
     getInputPath(): string | undefined {
+        // First try to get from active workspace
+        try {
+            const wsConfig = JSON.parse(
+                fs.readFileSync(this.workspaceConfigPath, 'utf-8')
+            );
+            const activeWorkspace = wsConfig.workspaces.find((w: any) => w.name === wsConfig.lastUsed);
+            if (activeWorkspace && activeWorkspace.inputPath) {
+                return activeWorkspace.inputPath;
+            }
+        } catch {
+            // Fall back to config
+        }
         return this.config.inputPath;
     }
 
     getOutputPath(): string {
+        // First try to get from active workspace
+        try {
+            const wsConfig = JSON.parse(
+                fs.readFileSync(this.workspaceConfigPath, 'utf-8')
+            );
+            const activeWorkspace = wsConfig.workspaces.find((w: any) => w.name === wsConfig.lastUsed);
+            if (activeWorkspace && activeWorkspace.outputPath) {
+                return activeWorkspace.outputPath;
+            }
+        } catch {
+            // Fall back to config
+        }
         return this.config.outputPath;
     }
 
