@@ -1,6 +1,6 @@
 {
   "name": "@backendkit-labs/curator-codex-agent",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Codex Curator — intelligent source code analysis and knowledge extraction into enterprise vaults using LLM reasoning.",
   "main": "dist/server.js",
   "bin": {
