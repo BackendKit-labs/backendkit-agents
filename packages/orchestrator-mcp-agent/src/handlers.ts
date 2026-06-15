@@ -277,6 +277,46 @@ export async function hListRuns(ctx: HandlerCtx): Promise<string> {
     return JSON.stringify(runs);
 }
 
+export async function hGetConfig(ctx: HandlerCtx): Promise<string> {
+    const { config, configDir } = ctx;
+
+    const flows = (config.flows ?? []).map(entry => {
+        try {
+            const flow = loadFlow(path.resolve(configDir, entry.file));
+            return {
+                id:          entry.id,
+                file:        entry.file,
+                trigger:     entry.trigger,
+                name:        flow.name,
+                description: flow.description,
+                steps:       flow.steps,
+            };
+        } catch (e) {
+            return { id: entry.id, file: entry.file, trigger: entry.trigger, error: (e as Error).message, steps: [] };
+        }
+    });
+
+    return JSON.stringify({
+        orchestrator: {
+            name:     config.orchestrator.name,
+            data_dir: config.orchestrator.data_dir,
+        },
+        agents: (config.agents ?? []).map(a => ({
+            id:          a.id,
+            description: a.description,
+            strategy:    a.strategy,
+            capability:  a.capability,
+            timeout:     a.timeout,
+            gate:        a.gate,
+            instances:   (a.instances ?? []).map(i => ({ url: i.url })),
+        })),
+        flows,
+        settings: {
+            maxConcurrentFlows: Number(process.env['MAX_CONCURRENT_FLOWS'] ?? 3),
+        },
+    });
+}
+
 // Async variant: creates run, fires execution in background, returns run_id immediately
 export async function hStartFlow(ctx: HandlerCtx, flowId: string, input: Record<string, unknown>): Promise<string> {
     const entry = (ctx.config.flows ?? []).find(f => f.id === flowId);
@@ -330,6 +370,7 @@ export async function dispatch(ctx: HandlerCtx, name: string, args: Record<strin
         case 'list_agents':        return hListAgents(ctx);
         case 'list_agents_json':   return hListAgentsJson(ctx);
         case 'list_runs':          return hListRuns(ctx);
+        case 'get_config':         return hGetConfig(ctx);
         default: throw new Error(`Unknown tool: ${name}`);
     }
 }

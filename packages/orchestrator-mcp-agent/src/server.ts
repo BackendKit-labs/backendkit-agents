@@ -30,7 +30,7 @@ import { RunStore }       from './run-store.js';
 import {
     type HandlerCtx,
     dispatch,
-    hRunFlow, hStartFlow, hRunTask, hApprove, hReject, hRetry, hStatus, hListAgents, hListAgentsJson, hListRuns,
+    hRunFlow, hStartFlow, hRunTask, hApprove, hReject, hRetry, hStatus, hListAgents, hListAgentsJson, hListRuns, hGetConfig,
 } from './handlers.js';
 
 // ── Bootstrap ─────────────────────────────────────────────────────────────────
@@ -93,6 +93,11 @@ if (HTTP_PORT) {
         // Agent health (JSON)
         if (req.method === 'GET' && req.url === '/v1/agents') {
             return send(200, JSON.parse(await hListAgentsJson(ctx)));
+        }
+
+        // Full config (agents + flows + settings)
+        if (req.method === 'GET' && req.url === '/v1/config') {
+            return send(200, JSON.parse(await hGetConfig(ctx)));
         }
 
         // Tool call
@@ -201,6 +206,11 @@ if (HTTP_PORT) {
 
     mcp.tool('list_runs', 'List all flow runs with their current status as JSON.', {}, async () => {
         try { return ok(await hListRuns(ctx)); }
+        catch (err) { return ok(`Error: ${(err as Error).message}`); }
+    });
+
+    mcp.tool('get_config', 'Return full orchestrator config: agents, flows (with steps), and settings.', {}, async () => {
+        try { return ok(await hGetConfig(ctx)); }
         catch (err) { return ok(`Error: ${(err as Error).message}`); }
     });
 
