@@ -15,6 +15,33 @@ export interface HandlerCtx {
 
 const ts = () => new Date().toISOString();
 
+// ── Concurrency guards ────────────────────────────────────────────────────────
+
+// Prevents double-processing the same run (e.g. two operators approve simultaneously)
+const inFlight = new Set<string>();
+
+// Limits concurrent LLM executions to avoid API rate-limit bursts
+class Semaphore {
+    private count: number;
+    private readonly queue: Array<() => void> = [];
+    constructor(max: number) { this.count = max; }
+    acquire(): Promise<void> {
+        return new Promise<void>(resolve => {
+            if (this.count-- > 0) resolve();
+            else this.queue.push(resolve);
+        });
+    }
+    release(): void {
+        const next = this.queue.shift();
+        if (next) next();
+        else this.count++;
+    }
+}
+
+const execSemaphore = new Semaphore(Number(process.env['MAX_CONCURRENT_FLOWS'] ?? 3));
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 function isGate(r: FlowResult | GateHit | StepFailed): r is GateHit {
     return (r as GateHit).gateRequired === true;
 }
@@ -87,42 +114,53 @@ export async function hRunTask(ctx: HandlerCtx, task: string, input: Record<stri
 }
 
 export async function hApprove(ctx: HandlerCtx, runId: string, feedback?: string): Promise<string> {
-    const { config, configDir, executor, store } = ctx;
-    const run = await store.get(runId);
-    if (!run) return `Run '${runId}' not found`;
-    if (run.status !== 'waiting_gate') return `Run '${runId}' is not waiting for approval (status: ${run.status})`;
+    if (inFlight.has(runId)) return `Run '${runId}' is already being processed`;
+    inFlight.add(runId);
+    try {
+        const { config, configDir, executor, store } = ctx;
+        const run = await store.get(runId);
+        if (!run) return `Run '${runId}' not found`;
+        if (run.status !== 'waiting_gate') return `Run '${runId}' is not waiting for approval (status: ${run.status})`;
 
-    const entry = (config.flows ?? []).find(f => f.id === run.flowId);
-    if (!entry) return `Flow '${run.flowId}' not found in config`;
+        const entry = (config.flows ?? []).find(f => f.id === run.flowId);
+        if (!entry) return `Flow '${run.flowId}' not found in config`;
 
-    // Mark running immediately so the kanban reflects progress during LLM execution
-    Object.assign(run, { status: 'running', gateStepId: undefined, updatedAt: ts() });
-    await store.save(run);
-
-    const flow   = loadFlow(path.resolve(configDir, entry.file));
-    const input  = { ...run.input, ...(feedback ? { approval_feedback: feedback } : {}) };
-    const result = await executor.execute(flow, input, run.results);
-
-    if (isGate(result)) {
-        Object.assign(run, { status: 'waiting_gate', results: result.completedSoFar, gateStepId: result.stepId, updatedAt: ts() });
+        Object.assign(run, { status: 'running', gateStepId: undefined, updatedAt: ts() });
         await store.save(run);
-        return [
-            `⏸ Next gate at step "${result.stepId}" (agent: ${result.agentId})`,
-            `\nOutput:\n${result.output}`,
-            result.criteria.length ? `\nCriteria:\n${result.criteria.map(c => `  • ${c}`).join('\n')}` : '',
-            `\nApprove: orchestrator_approve(run_id="${runId}")`,
-        ].filter(Boolean).join('\n');
-    }
 
-    if (isStepFailed(result)) {
-        Object.assign(run, { status: 'waiting_retry', results: result.completedSoFar, failedStepId: result.stepId, error: result.error, updatedAt: ts() });
-        await store.save(run);
-        return [`✗ Required step "${result.stepId}" (agent: ${result.agentId}) failed`, `\nError: ${result.error}`, `\nRetry: orchestrator_retry(run_id="${runId}")`].join('\n');
-    }
+        const flow  = loadFlow(path.resolve(configDir, entry.file));
+        const input = { ...run.input, ...(feedback ? { approval_feedback: feedback } : {}) };
 
-    Object.assign(run, { status: result.complete ? 'done' : 'failed', results: result.steps, summary: result.summary, updatedAt: ts() });
-    await store.save(run);
-    return result.summary;
+        await execSemaphore.acquire();
+        try {
+            const result = await executor.execute(flow, input, run.results);
+
+            if (isGate(result)) {
+                Object.assign(run, { status: 'waiting_gate', results: result.completedSoFar, gateStepId: result.stepId, updatedAt: ts() });
+                await store.save(run);
+                return [
+                    `⏸ Next gate at step "${result.stepId}" (agent: ${result.agentId})`,
+                    `\nOutput:\n${result.output}`,
+                    result.criteria.length ? `\nCriteria:\n${result.criteria.map(c => `  • ${c}`).join('\n')}` : '',
+                    `\nApprove: orchestrator_approve(run_id="${runId}")`,
+                ].filter(Boolean).join('\n');
+            }
+
+            if (isStepFailed(result)) {
+                Object.assign(run, { status: 'waiting_retry', results: result.completedSoFar, failedStepId: result.stepId, error: result.error, updatedAt: ts() });
+                await store.save(run);
+                return [`✗ Required step "${result.stepId}" (agent: ${result.agentId}) failed`, `\nError: ${result.error}`, `\nRetry: orchestrator_retry(run_id="${runId}")`].join('\n');
+            }
+
+            Object.assign(run, { status: result.complete ? 'done' : 'failed', results: result.steps, summary: result.summary, updatedAt: ts() });
+            await store.save(run);
+            return result.summary;
+        } finally {
+            execSemaphore.release();
+        }
+    } finally {
+        inFlight.delete(runId);
+    }
 }
 
 export async function hReject(ctx: HandlerCtx, runId: string, reason?: string): Promise<string> {
@@ -135,41 +173,52 @@ export async function hReject(ctx: HandlerCtx, runId: string, reason?: string): 
 }
 
 export async function hRetry(ctx: HandlerCtx, runId: string, feedback?: string): Promise<string> {
-    const { config, configDir, executor, store } = ctx;
-    const run = await store.get(runId);
-    if (!run) return `Run '${runId}' not found`;
-    if (run.status !== 'waiting_retry') return `Run '${runId}' is not waiting for retry (status: ${run.status})`;
+    if (inFlight.has(runId)) return `Run '${runId}' is already being processed`;
+    inFlight.add(runId);
+    try {
+        const { config, configDir, executor, store } = ctx;
+        const run = await store.get(runId);
+        if (!run) return `Run '${runId}' not found`;
+        if (run.status !== 'waiting_retry') return `Run '${runId}' is not waiting for retry (status: ${run.status})`;
 
-    const entry = (config.flows ?? []).find(f => f.id === run.flowId);
-    if (!entry) return `Flow '${run.flowId}' not found in config`;
+        const entry = (config.flows ?? []).find(f => f.id === run.flowId);
+        if (!entry) return `Flow '${run.flowId}' not found in config`;
 
-    // Mark running immediately so the kanban reflects progress during LLM execution
-    Object.assign(run, { status: 'running', failedStepId: undefined, updatedAt: ts() });
-    await store.save(run);
-
-    const flow   = loadFlow(path.resolve(configDir, entry.file));
-    const input  = { ...run.input, ...(feedback ? { retry_feedback: feedback } : {}) };
-    const result = await executor.execute(flow, input, run.results);
-
-    if (isStepFailed(result)) {
-        Object.assign(run, { results: result.completedSoFar, failedStepId: result.stepId, error: result.error, updatedAt: ts() });
+        Object.assign(run, { status: 'running', failedStepId: undefined, updatedAt: ts() });
         await store.save(run);
-        return [`✗ Step "${result.stepId}" failed again`, `\nError: ${result.error}`, `\nRetry: orchestrator_retry(run_id="${runId}")`].join('\n');
-    }
 
-    if (isGate(result)) {
-        Object.assign(run, { status: 'waiting_gate', results: result.completedSoFar, gateStepId: result.stepId, updatedAt: ts() });
-        await store.save(run);
-        return [
-            `⏸ Gate at step "${result.stepId}" (agent: ${result.agentId})`,
-            `\nOutput:\n${result.output}`,
-            `\nApprove: orchestrator_approve(run_id="${runId}")`,
-        ].join('\n');
-    }
+        const flow  = loadFlow(path.resolve(configDir, entry.file));
+        const input = { ...run.input, ...(feedback ? { retry_feedback: feedback } : {}) };
 
-    Object.assign(run, { status: result.complete ? 'done' : 'failed', results: result.steps, summary: result.summary, updatedAt: ts() });
-    await store.save(run);
-    return result.summary;
+        await execSemaphore.acquire();
+        try {
+            const result = await executor.execute(flow, input, run.results);
+
+            if (isStepFailed(result)) {
+                Object.assign(run, { status: 'waiting_retry', results: result.completedSoFar, failedStepId: result.stepId, error: result.error, updatedAt: ts() });
+                await store.save(run);
+                return [`✗ Step "${result.stepId}" failed again`, `\nError: ${result.error}`, `\nRetry: orchestrator_retry(run_id="${runId}")`].join('\n');
+            }
+
+            if (isGate(result)) {
+                Object.assign(run, { status: 'waiting_gate', results: result.completedSoFar, gateStepId: result.stepId, updatedAt: ts() });
+                await store.save(run);
+                return [
+                    `⏸ Gate at step "${result.stepId}" (agent: ${result.agentId})`,
+                    `\nOutput:\n${result.output}`,
+                    `\nApprove: orchestrator_approve(run_id="${runId}")`,
+                ].join('\n');
+            }
+
+            Object.assign(run, { status: result.complete ? 'done' : 'failed', results: result.steps, summary: result.summary, updatedAt: ts() });
+            await store.save(run);
+            return result.summary;
+        } finally {
+            execSemaphore.release();
+        }
+    } finally {
+        inFlight.delete(runId);
+    }
 }
 
 export async function hStatus(ctx: HandlerCtx, runId: string): Promise<string> {
@@ -230,6 +279,7 @@ export async function hStartFlow(ctx: HandlerCtx, flowId: string, input: Record<
     await store.save(run);
 
     setImmediate(async () => {
+        await execSemaphore.acquire();
         try {
             const result = await executor.execute(flow, input);
             if (isGate(result)) {
@@ -241,6 +291,8 @@ export async function hStartFlow(ctx: HandlerCtx, flowId: string, input: Record<
             }
         } catch (err) {
             Object.assign(run, { status: 'failed', error: (err as Error).message, updatedAt: ts() });
+        } finally {
+            execSemaphore.release();
         }
         await store.save(run).catch((e: Error) => process.stderr.write(`[hStartFlow] save error: ${e.message}\n`));
     });
