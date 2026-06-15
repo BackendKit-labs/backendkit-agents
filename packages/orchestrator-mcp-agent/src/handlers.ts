@@ -137,10 +137,14 @@ export async function hApprove(ctx: HandlerCtx, runId: string, feedback?: string
 
         await execSemaphore.acquire();
         try {
-            const result = await executor.execute(flow, input, run.results);
+            const onStepStart = async (stepId: string) => {
+                Object.assign(run, { currentStepId: stepId, updatedAt: ts() });
+                await store.save(run);
+            };
+            const result = await executor.execute(flow, input, run.results, onStepStart);
 
             if (isGate(result)) {
-                Object.assign(run, { status: 'waiting_gate', results: result.completedSoFar, gateStepId: result.stepId, updatedAt: ts() });
+                Object.assign(run, { status: 'waiting_gate', currentStepId: undefined, results: result.completedSoFar, gateStepId: result.stepId, gateCriteria: result.criteria, updatedAt: ts() });
                 await store.save(run);
                 return [
                     `⏸ Next gate at step "${result.stepId}" (agent: ${result.agentId})`,
@@ -151,12 +155,12 @@ export async function hApprove(ctx: HandlerCtx, runId: string, feedback?: string
             }
 
             if (isStepFailed(result)) {
-                Object.assign(run, { status: 'waiting_retry', results: result.completedSoFar, failedStepId: result.stepId, error: result.error, updatedAt: ts() });
+                Object.assign(run, { status: 'waiting_retry', currentStepId: undefined, results: result.completedSoFar, failedStepId: result.stepId, error: result.error, updatedAt: ts() });
                 await store.save(run);
                 return [`✗ Required step "${result.stepId}" (agent: ${result.agentId}) failed`, `\nError: ${result.error}`, `\nRetry: orchestrator_retry(run_id="${runId}")`].join('\n');
             }
 
-            Object.assign(run, { status: result.complete ? 'done' : 'failed', results: result.steps, summary: result.summary, updatedAt: ts() });
+            Object.assign(run, { status: result.complete ? 'done' : 'failed', currentStepId: undefined, results: result.steps, summary: result.summary, updatedAt: ts() });
             await store.save(run);
             return result.summary;
         } finally {
@@ -196,16 +200,20 @@ export async function hRetry(ctx: HandlerCtx, runId: string, feedback?: string):
 
         await execSemaphore.acquire();
         try {
-            const result = await executor.execute(flow, input, run.results);
+            const onStepStart = async (stepId: string) => {
+                Object.assign(run, { currentStepId: stepId, updatedAt: ts() });
+                await store.save(run);
+            };
+            const result = await executor.execute(flow, input, run.results, onStepStart);
 
             if (isStepFailed(result)) {
-                Object.assign(run, { status: 'waiting_retry', results: result.completedSoFar, failedStepId: result.stepId, error: result.error, updatedAt: ts() });
+                Object.assign(run, { status: 'waiting_retry', currentStepId: undefined, results: result.completedSoFar, failedStepId: result.stepId, error: result.error, updatedAt: ts() });
                 await store.save(run);
                 return [`✗ Step "${result.stepId}" failed again`, `\nError: ${result.error}`, `\nRetry: orchestrator_retry(run_id="${runId}")`].join('\n');
             }
 
             if (isGate(result)) {
-                Object.assign(run, { status: 'waiting_gate', results: result.completedSoFar, gateStepId: result.stepId, updatedAt: ts() });
+                Object.assign(run, { status: 'waiting_gate', currentStepId: undefined, results: result.completedSoFar, gateStepId: result.stepId, gateCriteria: result.criteria, updatedAt: ts() });
                 await store.save(run);
                 return [
                     `⏸ Gate at step "${result.stepId}" (agent: ${result.agentId})`,
@@ -214,7 +222,7 @@ export async function hRetry(ctx: HandlerCtx, runId: string, feedback?: string):
                 ].join('\n');
             }
 
-            Object.assign(run, { status: result.complete ? 'done' : 'failed', results: result.steps, summary: result.summary, updatedAt: ts() });
+            Object.assign(run, { status: result.complete ? 'done' : 'failed', currentStepId: undefined, results: result.steps, summary: result.summary, updatedAt: ts() });
             await store.save(run);
             return result.summary;
         } finally {
@@ -285,16 +293,20 @@ export async function hStartFlow(ctx: HandlerCtx, flowId: string, input: Record<
     setImmediate(async () => {
         await execSemaphore.acquire();
         try {
-            const result = await executor.execute(flow, input);
+            const onStepStart = async (stepId: string) => {
+                Object.assign(run, { currentStepId: stepId, updatedAt: ts() });
+                await store.save(run);
+            };
+            const result = await executor.execute(flow, input, [], onStepStart);
             if (isGate(result)) {
-                Object.assign(run, { status: 'waiting_gate', results: result.completedSoFar, gateStepId: result.stepId, updatedAt: ts() });
+                Object.assign(run, { status: 'waiting_gate', currentStepId: undefined, results: result.completedSoFar, gateStepId: result.stepId, gateCriteria: result.criteria, updatedAt: ts() });
             } else if (isStepFailed(result)) {
-                Object.assign(run, { status: 'waiting_retry', results: result.completedSoFar, failedStepId: result.stepId, error: result.error, updatedAt: ts() });
+                Object.assign(run, { status: 'waiting_retry', currentStepId: undefined, results: result.completedSoFar, failedStepId: result.stepId, error: result.error, updatedAt: ts() });
             } else {
-                Object.assign(run, { status: result.complete ? 'done' : 'failed', results: result.steps, summary: result.summary, updatedAt: ts() });
+                Object.assign(run, { status: result.complete ? 'done' : 'failed', currentStepId: undefined, results: result.steps, summary: result.summary, updatedAt: ts() });
             }
         } catch (err) {
-            Object.assign(run, { status: 'failed', error: (err as Error).message, updatedAt: ts() });
+            Object.assign(run, { status: 'failed', currentStepId: undefined, error: (err as Error).message, updatedAt: ts() });
         } finally {
             execSemaphore.release();
         }

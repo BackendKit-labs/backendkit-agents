@@ -8,6 +8,7 @@ export interface StepResult {
     stepId:     string;
     agentId:    string;
     capability: string;
+    task?:      string;
     output:     string;
     success:    boolean;
     durationMs: number;
@@ -62,6 +63,7 @@ export class FlowExecutor {
         flow:         Flow,
         input:        Record<string, unknown> = {},
         priorResults: StepResult[] = [],
+        onStepStart?: (stepId: string, agentId: string, task: string) => Promise<void>,
     ): Promise<FlowResult | GateHit | StepFailed> {
         const context: AgentContext = {
             tenantId:  this.tenantId,
@@ -83,6 +85,7 @@ export class FlowExecutor {
             }
 
             this.onProgress(`[${flow.id}] step ${step.id} → agent ${step.agentId ?? step.agent}`);
+            if (onStepStart) await onStepStart(step.id, step.agent, step.task ?? '');
 
             const result = await this.runStep(step, input, completed, context);
             const pending = flow.steps.slice(flow.steps.indexOf(step) + 1).map(s => s.id);
@@ -159,6 +162,7 @@ export class FlowExecutor {
                 stepId:     step.id,
                 agentId:    step.agent,
                 capability,
+                task:       step.task,
                 output,
                 success:    true,
                 durationMs: Date.now() - start,
@@ -169,6 +173,7 @@ export class FlowExecutor {
                 stepId:     step.id,
                 agentId:    step.agent,
                 capability,
+                task:       step.task,
                 output,
                 success:    false,
                 durationMs: Date.now() - start,
