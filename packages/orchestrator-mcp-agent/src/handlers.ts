@@ -27,8 +27,12 @@ class Semaphore {
     constructor(max: number) { this.count = max; }
     acquire(): Promise<void> {
         return new Promise<void>(resolve => {
-            if (this.count-- > 0) resolve();
-            else this.queue.push(resolve);
+            if (this.count > 0) {
+                this.count--;
+                resolve();
+            } else {
+                this.queue.push(resolve);
+            }
         });
     }
     release(): void {
