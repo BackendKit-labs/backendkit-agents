@@ -4,7 +4,7 @@ import type { StepResult } from './executor.js';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
-export type RunStatus = 'running' | 'waiting_gate' | 'done' | 'failed' | 'cancelled';
+export type RunStatus = 'running' | 'waiting_gate' | 'waiting_retry' | 'done' | 'failed' | 'cancelled';
 
 export interface RunState {
     id:            string;

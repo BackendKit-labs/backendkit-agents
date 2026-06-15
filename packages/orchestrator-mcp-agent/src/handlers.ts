@@ -189,6 +189,25 @@ export async function hListAgents(ctx: HandlerCtx): Promise<string> {
     return lines.join('\n\n') || 'No agents registered';
 }
 
+export async function hListAgentsJson(ctx: HandlerCtx): Promise<string> {
+    const health = await ctx.registry.healthAll();
+    const agents = ctx.registry.agentIds().map(id => {
+        const cfg = ctx.registry.config(id);
+        return {
+            id,
+            description: cfg.description ?? '',
+            strategy:    cfg.strategy,
+            instances:   (health[id] ?? []).map(i => ({ url: i.url, ok: i.ok, circuitState: i.circuitState })),
+        };
+    });
+    return JSON.stringify(agents);
+}
+
+export async function hListRuns(ctx: HandlerCtx): Promise<string> {
+    const runs = await ctx.store.list();
+    return JSON.stringify(runs);
+}
+
 // ── Dispatcher (used by HTTP server) ──────────────────────────────────────────
 
 export async function dispatch(ctx: HandlerCtx, name: string, args: Record<string, unknown>): Promise<string> {
@@ -200,6 +219,8 @@ export async function dispatch(ctx: HandlerCtx, name: string, args: Record<strin
         case 'orchestrator_retry':   return hRetry(ctx, String(args['run_id'] ?? ''), args['feedback'] as string | undefined);
         case 'run_status':         return hStatus(ctx, String(args['run_id'] ?? ''));
         case 'list_agents':        return hListAgents(ctx);
+        case 'list_agents_json':   return hListAgentsJson(ctx);
+        case 'list_runs':          return hListRuns(ctx);
         default: throw new Error(`Unknown tool: ${name}`);
     }
 }
