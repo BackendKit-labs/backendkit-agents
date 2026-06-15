@@ -20,6 +20,8 @@ const AgentConfigSchema = z.object({
     // HTTP pool
     instances:      z.array(InstanceSchema).min(1).optional(),
     strategy:       StrategySchema,
+    // Per-agent request timeout in ms (default: 30s; increase for LLM-backed agents)
+    timeout:        z.number().int().positive().optional(),
     // Per-agent default capability (what to call when a flow step doesn't specify one)
     capability:     z.string().default('execute'),
     // Gate config (same semantics as orchestrator-agent)

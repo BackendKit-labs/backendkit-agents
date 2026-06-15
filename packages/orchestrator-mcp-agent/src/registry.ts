@@ -31,6 +31,7 @@ export class PoolRegistry {
                         tenantId:       this.tenantId,
                         maxRetries:     3,
                         circuitBreaker: true,
+                        ...(agent.timeout !== undefined && { timeout: agent.timeout }),
                     })
                 );
 
