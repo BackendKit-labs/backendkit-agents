@@ -21,6 +21,8 @@
     "@backendkit-labs/agent-enterprise": "^0.4.0",
     "@backendkit-labs/agent-protocol": "^0.2.0",
     "@modelcontextprotocol/sdk": "^1.12.0",
+    "@types/better-sqlite3": "^7.6.13",
+    "better-sqlite3": "^12.11.1",
     "yaml": "^2.4.0",
     "zod": "^3.25.0"
   },

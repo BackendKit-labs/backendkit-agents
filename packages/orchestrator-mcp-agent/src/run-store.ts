@@ -1,5 +1,6 @@
-import * as fs   from 'node:fs';
-import * as path from 'node:path';
+import Database from 'better-sqlite3';
+import * as path  from 'node:path';
+import * as fs    from 'node:fs';
 import type { StepResult } from './executor.js';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -20,38 +21,117 @@ export interface RunState {
     updatedAt:     string;
 }
 
-// ── RunStore — simple file-based persistence ──────────────────────────────────
+// ── Row shape (SQLite stores JSON fields as text) ─────────────────────────────
+
+interface RunRow {
+    id:            string;
+    flowId:        string;
+    status:        string;
+    input:         string;
+    results:       string;
+    gateStepId:    string | null;
+    failedStepId:  string | null;
+    summary:       string | null;
+    error:         string | null;
+    createdAt:     string;
+    updatedAt:     string;
+}
+
+function rowToState(row: RunRow): RunState {
+    return {
+        id:           row.id,
+        flowId:       row.flowId,
+        status:       row.status as RunStatus,
+        input:        JSON.parse(row.input) as Record<string, unknown>,
+        results:      JSON.parse(row.results) as StepResult[],
+        gateStepId:   row.gateStepId   ?? undefined,
+        failedStepId: row.failedStepId ?? undefined,
+        summary:      row.summary      ?? undefined,
+        error:        row.error        ?? undefined,
+        createdAt:    row.createdAt,
+        updatedAt:    row.updatedAt,
+    };
+}
+
+// ── RunStore — SQLite-backed persistence ──────────────────────────────────────
 
 export class RunStore {
-    private readonly dir: string;
+    private readonly db: Database.Database;
 
-    constructor(dir: string) {
-        this.dir = dir;
-        fs.mkdirSync(dir, { recursive: true });
+    private readonly upsert: Database.Statement;
+    private readonly selectById: Database.Statement;
+    private readonly selectAll: Database.Statement;
+    private readonly deleteById: Database.Statement;
+
+    constructor(dbPath: string) {
+        fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+        this.db = new Database(dbPath);
+        this.db.pragma('journal_mode = WAL');
+        this.db.pragma('synchronous = NORMAL');
+
+        this.db.exec(`
+            CREATE TABLE IF NOT EXISTS runs (
+                id           TEXT PRIMARY KEY,
+                flowId       TEXT NOT NULL,
+                status       TEXT NOT NULL,
+                input        TEXT NOT NULL,
+                results      TEXT NOT NULL,
+                gateStepId   TEXT,
+                failedStepId TEXT,
+                summary      TEXT,
+                error        TEXT,
+                createdAt    TEXT NOT NULL,
+                updatedAt    TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_runs_status    ON runs(status);
+            CREATE INDEX IF NOT EXISTS idx_runs_createdAt ON runs(createdAt DESC);
+        `);
+
+        this.upsert = this.db.prepare(`
+            INSERT INTO runs (id, flowId, status, input, results, gateStepId, failedStepId, summary, error, createdAt, updatedAt)
+            VALUES (@id, @flowId, @status, @input, @results, @gateStepId, @failedStepId, @summary, @error, @createdAt, @updatedAt)
+            ON CONFLICT(id) DO UPDATE SET
+                status       = excluded.status,
+                results      = excluded.results,
+                gateStepId   = excluded.gateStepId,
+                failedStepId = excluded.failedStepId,
+                summary      = excluded.summary,
+                error        = excluded.error,
+                updatedAt    = excluded.updatedAt
+        `);
+
+        this.selectById = this.db.prepare(`SELECT * FROM runs WHERE id = ?`);
+        this.selectAll  = this.db.prepare(`SELECT * FROM runs ORDER BY createdAt DESC`);
+        this.deleteById = this.db.prepare(`DELETE FROM runs WHERE id = ?`);
     }
 
     async save(run: RunState): Promise<void> {
-        const file = path.join(this.dir, `${run.id}.json`);
-        fs.writeFileSync(file, JSON.stringify(run, null, 2), 'utf-8');
+        this.upsert.run({
+            id:           run.id,
+            flowId:       run.flowId,
+            status:       run.status,
+            input:        JSON.stringify(run.input),
+            results:      JSON.stringify(run.results),
+            gateStepId:   run.gateStepId   ?? null,
+            failedStepId: run.failedStepId ?? null,
+            summary:      run.summary      ?? null,
+            error:        run.error        ?? null,
+            createdAt:    run.createdAt,
+            updatedAt:    run.updatedAt,
+        });
     }
 
     async get(id: string): Promise<RunState | null> {
-        const file = path.join(this.dir, `${id}.json`);
-        if (!fs.existsSync(file)) return null;
-        return JSON.parse(fs.readFileSync(file, 'utf-8')) as RunState;
+        const row = this.selectById.get(id) as RunRow | undefined;
+        return row ? rowToState(row) : null;
     }
 
     async list(): Promise<RunState[]> {
-        if (!fs.existsSync(this.dir)) return [];
-        const files = fs.readdirSync(this.dir).filter(f => f.endsWith('.json'));
-        return files.map(f =>
-            JSON.parse(fs.readFileSync(path.join(this.dir, f), 'utf-8')) as RunState
-        ).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+        return (this.selectAll.all() as RunRow[]).map(rowToState);
     }
 
     async delete(id: string): Promise<void> {
-        const file = path.join(this.dir, `${id}.json`);
-        if (fs.existsSync(file)) fs.unlinkSync(file);
+        this.deleteById.run(id);
     }
 
     newRun(flowId: string, input: Record<string, unknown>): RunState {

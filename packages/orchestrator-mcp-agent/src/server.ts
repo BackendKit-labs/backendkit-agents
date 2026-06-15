@@ -43,7 +43,7 @@ const config    = loadConfig(configPath);
 const configDir = path.dirname(path.resolve(configPath));
 const dataDir   = resolveDataDir(configPath, config);
 const registry  = new PoolRegistry(config);
-const store     = new RunStore(path.join(dataDir, 'runs'));
+const store     = new RunStore(path.join(dataDir, 'runs.db'));
 const executor  = new FlowExecutor({
     registry,
     tenantId:   config.orchestrator.tenant_id,
