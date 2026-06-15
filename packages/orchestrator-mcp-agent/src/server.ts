@@ -30,7 +30,7 @@ import { RunStore }       from './run-store.js';
 import {
     type HandlerCtx,
     dispatch,
-    hRunFlow, hRunTask, hApprove, hReject, hRetry, hStatus, hListAgents, hListAgentsJson, hListRuns,
+    hRunFlow, hStartFlow, hRunTask, hApprove, hReject, hRetry, hStatus, hListAgents, hListAgentsJson, hListRuns,
 } from './handlers.js';
 
 // ── Bootstrap ─────────────────────────────────────────────────────────────────
@@ -77,6 +77,19 @@ if (HTTP_PORT) {
             return send(200, runs);
         }
 
+        // Async start: create run and fire execution in background, return run_id immediately
+        if (req.method === 'POST' && req.url === '/v1/runs/start') {
+            const chunks: Buffer[] = [];
+            for await (const chunk of req) chunks.push(chunk as Buffer);
+            try {
+                const body = JSON.parse(Buffer.concat(chunks).toString()) as { flow_id: string; input?: Record<string, unknown> };
+                const result = JSON.parse(await hStartFlow(ctx, body.flow_id, body.input ?? {})) as { run_id?: string; error?: string };
+                return send(result.error ? 400 : 202, result);
+            } catch {
+                return send(400, { error: 'Invalid JSON body' });
+            }
+        }
+
         // Agent health (JSON)
         if (req.method === 'GET' && req.url === '/v1/agents') {
             return send(200, JSON.parse(await hListAgentsJson(ctx)));
@@ -121,12 +134,20 @@ if (HTTP_PORT) {
     const ok  = (text: string) => ({ content: [{ type: 'text' as const, text }] });
     const mcp = new McpServer({ name: config.orchestrator.name, version: '0.1.0' });
 
-    mcp.tool('run_flow', 'Trigger a named flow with input data.', {
+    mcp.tool('run_flow', 'Trigger a named flow with input data (blocking — waits for completion).', {
         flow_id: z.string().describe('Flow ID as declared in orchestrator-mcp.yaml'),
         input:   z.record(z.unknown()).default({}).describe('Input data for the flow'),
     }, async ({ flow_id, input }) => {
         try { return ok(await hRunFlow(ctx, flow_id, input)); }
         catch (err) { return ok(`Error: ${(err as Error).message}`); }
+    });
+
+    mcp.tool('start_flow', 'Start a named flow asynchronously. Returns run_id immediately; poll run_status for progress.', {
+        flow_id: z.string().describe('Flow ID as declared in orchestrator-mcp.yaml'),
+        input:   z.record(z.unknown()).default({}).describe('Input data for the flow'),
+    }, async ({ flow_id, input }) => {
+        try { return ok(await hStartFlow(ctx, flow_id, input)); }
+        catch (err) { return ok(JSON.stringify({ error: (err as Error).message })); }
     });
 
     mcp.tool('run_task', 'Run a task — auto-routes to a matching flow based on the task description.', {

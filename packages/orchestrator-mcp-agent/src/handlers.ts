@@ -95,12 +95,16 @@ export async function hApprove(ctx: HandlerCtx, runId: string, feedback?: string
     const entry = (config.flows ?? []).find(f => f.id === run.flowId);
     if (!entry) return `Flow '${run.flowId}' not found in config`;
 
+    // Mark running immediately so the kanban reflects progress during LLM execution
+    Object.assign(run, { status: 'running', gateStepId: undefined, updatedAt: ts() });
+    await store.save(run);
+
     const flow   = loadFlow(path.resolve(configDir, entry.file));
     const input  = { ...run.input, ...(feedback ? { approval_feedback: feedback } : {}) };
     const result = await executor.execute(flow, input, run.results);
 
     if (isGate(result)) {
-        Object.assign(run, { results: result.completedSoFar, gateStepId: result.stepId, updatedAt: ts() });
+        Object.assign(run, { status: 'waiting_gate', results: result.completedSoFar, gateStepId: result.stepId, updatedAt: ts() });
         await store.save(run);
         return [
             `⏸ Next gate at step "${result.stepId}" (agent: ${result.agentId})`,
@@ -138,6 +142,10 @@ export async function hRetry(ctx: HandlerCtx, runId: string, feedback?: string):
 
     const entry = (config.flows ?? []).find(f => f.id === run.flowId);
     if (!entry) return `Flow '${run.flowId}' not found in config`;
+
+    // Mark running immediately so the kanban reflects progress during LLM execution
+    Object.assign(run, { status: 'running', failedStepId: undefined, updatedAt: ts() });
+    await store.save(run);
 
     const flow   = loadFlow(path.resolve(configDir, entry.file));
     const input  = { ...run.input, ...(feedback ? { retry_feedback: feedback } : {}) };
@@ -208,11 +216,44 @@ export async function hListRuns(ctx: HandlerCtx): Promise<string> {
     return JSON.stringify(runs);
 }
 
+// Async variant: creates run, fires execution in background, returns run_id immediately
+export async function hStartFlow(ctx: HandlerCtx, flowId: string, input: Record<string, unknown>): Promise<string> {
+    const entry = (ctx.config.flows ?? []).find(f => f.id === flowId);
+    if (!entry) {
+        const ids = (ctx.config.flows ?? []).map(f => f.id).join(', ');
+        return JSON.stringify({ error: `Flow '${flowId}' not found. Available: ${ids || '(none)'}` });
+    }
+
+    const { executor, store, configDir } = ctx;
+    const flow = loadFlow(path.resolve(configDir, entry.file));
+    const run  = store.newRun(flowId, input);
+    await store.save(run);
+
+    setImmediate(async () => {
+        try {
+            const result = await executor.execute(flow, input);
+            if (isGate(result)) {
+                Object.assign(run, { status: 'waiting_gate', results: result.completedSoFar, gateStepId: result.stepId, updatedAt: ts() });
+            } else if (isStepFailed(result)) {
+                Object.assign(run, { status: 'waiting_retry', results: result.completedSoFar, failedStepId: result.stepId, error: result.error, updatedAt: ts() });
+            } else {
+                Object.assign(run, { status: result.complete ? 'done' : 'failed', results: result.steps, summary: result.summary, updatedAt: ts() });
+            }
+        } catch (err) {
+            Object.assign(run, { status: 'failed', error: (err as Error).message, updatedAt: ts() });
+        }
+        await store.save(run).catch((e: Error) => process.stderr.write(`[hStartFlow] save error: ${e.message}\n`));
+    });
+
+    return JSON.stringify({ run_id: run.id, status: 'running' });
+}
+
 // ── Dispatcher (used by HTTP server) ──────────────────────────────────────────
 
 export async function dispatch(ctx: HandlerCtx, name: string, args: Record<string, unknown>): Promise<string> {
     switch (name) {
         case 'run_flow':           return hRunFlow(ctx, String(args['flow_id'] ?? ''), (args['input'] ?? {}) as Record<string, unknown>);
+        case 'start_flow':         return hStartFlow(ctx, String(args['flow_id'] ?? ''), (args['input'] ?? {}) as Record<string, unknown>);
         case 'run_task':           return hRunTask(ctx, String(args['task'] ?? ''), (args['input'] ?? {}) as Record<string, unknown>);
         case 'orchestrator_approve': return hApprove(ctx, String(args['run_id'] ?? ''), args['feedback'] as string | undefined);
         case 'orchestrator_reject':  return hReject(ctx, String(args['run_id'] ?? ''), args['reason'] as string | undefined);
