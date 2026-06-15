@@ -25,12 +25,16 @@ import * as path                from 'node:path';
 import { loadConfig, resolveDataDir } from './config.js';
 import { PoolRegistry }   from './registry.js';
 import { FlowExecutor }   from './executor.js';
-import { matchFlow }      from './flow.js';
+import { loadFlow }       from './flow.js';
 import { RunStore }       from './run-store.js';
+import { ConfigStore }    from './config-store.js';
+import type { StoredAgent, StoredFlow } from './config-store.js';
 import {
     type HandlerCtx,
     dispatch,
-    hRunFlow, hStartFlow, hRunTask, hApprove, hReject, hRetry, hStatus, hListAgents, hListAgentsJson, hListRuns, hGetConfig,
+    hRunFlow, hStartFlow, hRunTask, hApprove, hReject, hRetry, hStatus,
+    hListAgents, hListAgentsJson, hListRuns, hGetConfig,
+    hSaveAgent, hDeleteAgent, hSaveFlow, hDeleteFlow,
 } from './handlers.js';
 
 // ── Bootstrap ─────────────────────────────────────────────────────────────────
@@ -50,7 +54,38 @@ const executor  = new FlowExecutor({
     onProgress: msg => process.stderr.write(msg + '\n'),
 });
 
-const ctx: HandlerCtx = { config, configDir, executor, store, registry };
+// ── ConfigStore — seed from YAML on first run ─────────────────────────────────
+
+const configStore = new ConfigStore(path.join(dataDir, 'config.db'));
+
+if (configStore.isEmpty()) {
+    const yamlFlows: StoredFlow[] = (config.flows ?? []).flatMap(entry => {
+        try {
+            const f = loadFlow(path.resolve(configDir, entry.file));
+            return [{
+                id:          entry.id,
+                name:        f.name,
+                description: f.description,
+                trigger:     entry.trigger,
+                steps:       f.steps.map((s, i) => ({
+                    id:            s.id,
+                    agent:         s.agent,
+                    task:          s.task,
+                    capability:    s.capability,
+                    input:         s.input,
+                    depends_on:    s.depends_on,
+                    gate:          s.gate ?? false,
+                    gate_criteria: s.gate_criteria,
+                    required:      s.required ?? false,
+                    position:      i,
+                })),
+            }];
+        } catch { return []; }
+    });
+    configStore.seedFromYaml(config, yamlFlows);
+}
+
+const ctx: HandlerCtx = { config, configDir, executor, store, registry, configStore };
 
 const log = (msg: string) => process.stderr.write(`[orchestrator-mcp-agent] ${msg}\n`);
 
@@ -66,62 +101,58 @@ if (HTTP_PORT) {
             res.end(JSON.stringify(body));
         };
 
-        // Health check
-        if (req.method === 'GET' && req.url === '/health') {
-            return send(200, { ok: true, name: config.orchestrator.name });
-        }
-
-        // Run list
-        if (req.method === 'GET' && req.url === '/v1/runs') {
-            const runs = await store.list();
-            return send(200, runs);
-        }
-
-        // Async start: create run and fire execution in background, return run_id immediately
-        if (req.method === 'POST' && req.url === '/v1/runs/start') {
+        const readBody = async (): Promise<unknown> => {
             const chunks: Buffer[] = [];
             for await (const chunk of req) chunks.push(chunk as Buffer);
+            return JSON.parse(Buffer.concat(chunks).toString());
+        };
+
+        const url = req.url ?? '/';
+
+        if (req.method === 'GET'  && url === '/health')   return send(200, { ok: true, name: config.orchestrator.name });
+        if (req.method === 'GET'  && url === '/v1/runs')  return send(200, await store.list());
+        if (req.method === 'GET'  && url === '/v1/agents') return send(200, JSON.parse(await hListAgentsJson(ctx)));
+        if (req.method === 'GET'  && url === '/v1/config') return send(200, JSON.parse(await hGetConfig(ctx)));
+
+        // ── Config CRUD ───────────────────────────────────────────────────────
+        if (req.method === 'GET'    && url === '/v1/config/agents')         return send(200, configStore.listAgents());
+        if (req.method === 'POST'   && url === '/v1/config/agents') {
+            const body = await readBody() as StoredAgent;
+            return send(200, JSON.parse(await hSaveAgent(ctx, body)));
+        }
+        if (req.method === 'DELETE' && url.startsWith('/v1/config/agents/')) {
+            const id = url.slice('/v1/config/agents/'.length);
+            return send(200, JSON.parse(await hDeleteAgent(ctx, id)));
+        }
+
+        if (req.method === 'GET'    && url === '/v1/config/flows')          return send(200, configStore.listFlows());
+        if (req.method === 'POST'   && url === '/v1/config/flows') {
+            const body = await readBody() as StoredFlow;
+            return send(200, JSON.parse(await hSaveFlow(ctx, body)));
+        }
+        if (req.method === 'DELETE' && url.startsWith('/v1/config/flows/')) {
+            const id = url.slice('/v1/config/flows/'.length);
+            return send(200, JSON.parse(await hDeleteFlow(ctx, id)));
+        }
+
+        // ── Async start ───────────────────────────────────────────────────────
+        if (req.method === 'POST' && url === '/v1/runs/start') {
             try {
-                const body = JSON.parse(Buffer.concat(chunks).toString()) as { flow_id: string; input?: Record<string, unknown> };
+                const body   = await readBody() as { flow_id: string; input?: Record<string, unknown> };
                 const result = JSON.parse(await hStartFlow(ctx, body.flow_id, body.input ?? {})) as { run_id?: string; error?: string };
                 return send(result.error ? 400 : 202, result);
-            } catch {
-                return send(400, { error: 'Invalid JSON body' });
-            }
+            } catch { return send(400, { error: 'Invalid JSON body' }); }
         }
 
-        // Agent health (JSON)
-        if (req.method === 'GET' && req.url === '/v1/agents') {
-            return send(200, JSON.parse(await hListAgentsJson(ctx)));
-        }
-
-        // Full config (agents + flows + settings)
-        if (req.method === 'GET' && req.url === '/v1/config') {
-            return send(200, JSON.parse(await hGetConfig(ctx)));
-        }
-
-        // Tool call
-        if (req.method === 'POST' && req.url === '/v1/tools/call') {
-            const chunks: Buffer[] = [];
-            for await (const chunk of req) chunks.push(chunk as Buffer);
-            let name: string;
-            let args: Record<string, unknown>;
+        // ── Generic tool call ─────────────────────────────────────────────────
+        if (req.method === 'POST' && url === '/v1/tools/call') {
+            let name: string; let args: Record<string, unknown>;
             try {
-                const body = JSON.parse(Buffer.concat(chunks).toString()) as {
-                    name: string;
-                    arguments?: Record<string, unknown>;
-                };
-                name = body.name;
-                args = body.arguments ?? {};
-            } catch {
-                return send(400, { ok: false, error: 'Invalid JSON body' });
-            }
-            try {
-                const result = await dispatch(ctx, name, args);
-                return send(200, { ok: true, result });
-            } catch (err) {
-                return send(200, { ok: false, error: (err as Error).message });
-            }
+                const body = await readBody() as { name: string; arguments?: Record<string, unknown> };
+                name = body.name; args = body.arguments ?? {};
+            } catch { return send(400, { ok: false, error: 'Invalid JSON body' }); }
+            try { return send(200, { ok: true, result: await dispatch(ctx, name, args) }); }
+            catch (err) { return send(200, { ok: false, error: (err as Error).message }); }
         }
 
         send(404, { error: 'Not found' });
@@ -130,7 +161,7 @@ if (HTTP_PORT) {
     httpServer.listen(port, () => {
         log(`${config.orchestrator.name} HTTP on :${port}`);
         log(`agents: ${registry.agentIds().join(', ')}`);
-        log(`flows: ${(config.flows ?? []).map(f => f.id).join(', ') || '(none)'}`);
+        log(`flows: ${configStore.listFlows().map(f => f.id).join(', ') || '(none)'}`);
     });
 
 // ── Stdio MCP mode ────────────────────────────────────────────────────────────
@@ -139,84 +170,98 @@ if (HTTP_PORT) {
     const ok  = (text: string) => ({ content: [{ type: 'text' as const, text }] });
     const mcp = new McpServer({ name: config.orchestrator.name, version: '0.1.0' });
 
-    mcp.tool('run_flow', 'Trigger a named flow with input data (blocking — waits for completion).', {
-        flow_id: z.string().describe('Flow ID as declared in orchestrator-mcp.yaml'),
-        input:   z.record(z.unknown()).default({}).describe('Input data for the flow'),
+    mcp.tool('run_flow', 'Trigger a named flow with input data (blocking).', {
+        flow_id: z.string(), input: z.record(z.unknown()).default({}),
     }, async ({ flow_id, input }) => {
         try { return ok(await hRunFlow(ctx, flow_id, input)); }
         catch (err) { return ok(`Error: ${(err as Error).message}`); }
     });
 
-    mcp.tool('start_flow', 'Start a named flow asynchronously. Returns run_id immediately; poll run_status for progress.', {
-        flow_id: z.string().describe('Flow ID as declared in orchestrator-mcp.yaml'),
-        input:   z.record(z.unknown()).default({}).describe('Input data for the flow'),
+    mcp.tool('start_flow', 'Start a named flow asynchronously. Returns run_id immediately.', {
+        flow_id: z.string(), input: z.record(z.unknown()).default({}),
     }, async ({ flow_id, input }) => {
         try { return ok(await hStartFlow(ctx, flow_id, input)); }
         catch (err) { return ok(JSON.stringify({ error: (err as Error).message })); }
     });
 
-    mcp.tool('run_task', 'Run a task — auto-routes to a matching flow based on the task description.', {
-        task:  z.string().describe('Task description — used to match a flow trigger'),
-        input: z.record(z.unknown()).default({}).describe('Additional input data'),
+    mcp.tool('run_task', 'Run a task — auto-routes to a matching flow.', {
+        task: z.string(), input: z.record(z.unknown()).default({}),
     }, async ({ task, input }) => {
         try { return ok(await hRunTask(ctx, task, input)); }
         catch (err) { return ok(`Error: ${(err as Error).message}`); }
     });
 
     mcp.tool('orchestrator_approve', 'Approve a paused gate and resume the flow.', {
-        run_id:   z.string().describe('Run ID returned when the gate was hit'),
-        feedback: z.string().optional().describe('Optional feedback to pass to subsequent steps'),
+        run_id: z.string(), feedback: z.string().optional(),
     }, async ({ run_id, feedback }) => {
         try { return ok(await hApprove(ctx, run_id, feedback)); }
-        catch (err) { return ok(`Error resuming run: ${(err as Error).message}`); }
+        catch (err) { return ok(`Error: ${(err as Error).message}`); }
     });
 
     mcp.tool('orchestrator_reject', 'Reject a paused gate and cancel the flow.', {
-        run_id: z.string().describe('Run ID returned when the gate was hit'),
-        reason: z.string().optional().describe('Rejection reason'),
+        run_id: z.string(), reason: z.string().optional(),
     }, async ({ run_id, reason }) => {
         try { return ok(await hReject(ctx, run_id, reason)); }
         catch (err) { return ok(`Error: ${(err as Error).message}`); }
     });
 
-    mcp.tool('orchestrator_retry', 'Retry a flow paused because a required step failed.', {
-        run_id:   z.string().describe('Run ID returned when the required step failed'),
-        feedback: z.string().optional().describe('Optional context to pass to the retried step'),
+    mcp.tool('orchestrator_retry', 'Retry a flow paused on a required step failure.', {
+        run_id: z.string(), feedback: z.string().optional(),
     }, async ({ run_id, feedback }) => {
         try { return ok(await hRetry(ctx, run_id, feedback)); }
-        catch (err) { return ok(`Error retrying run: ${(err as Error).message}`); }
+        catch (err) { return ok(`Error: ${(err as Error).message}`); }
     });
 
-    mcp.tool('run_status', 'Check the status of a flow run.', {
-        run_id: z.string(),
-    }, async ({ run_id }) => {
+    mcp.tool('run_status', 'Check the status of a flow run.', { run_id: z.string() }, async ({ run_id }) => {
         try { return ok(await hStatus(ctx, run_id)); }
         catch (err) { return ok(`Error: ${(err as Error).message}`); }
     });
 
     mcp.tool('list_agents', 'List all registered agents and their health status.', {}, async () => {
-        try { return ok(await hListAgents(ctx)); }
-        catch (err) { return ok(`Error: ${(err as Error).message}`); }
+        try { return ok(await hListAgents(ctx)); } catch (err) { return ok(`Error: ${(err as Error).message}`); }
     });
 
-    mcp.tool('list_agents_json', 'List all registered agents and their health status as JSON.', {}, async () => {
-        try { return ok(await hListAgentsJson(ctx)); }
-        catch (err) { return ok(`Error: ${(err as Error).message}`); }
+    mcp.tool('list_agents_json', 'List agents as JSON.', {}, async () => {
+        try { return ok(await hListAgentsJson(ctx)); } catch (err) { return ok(`Error: ${(err as Error).message}`); }
     });
 
-    mcp.tool('list_runs', 'List all flow runs with their current status as JSON.', {}, async () => {
-        try { return ok(await hListRuns(ctx)); }
-        catch (err) { return ok(`Error: ${(err as Error).message}`); }
+    mcp.tool('list_runs', 'List all flow runs as JSON.', {}, async () => {
+        try { return ok(await hListRuns(ctx)); } catch (err) { return ok(`Error: ${(err as Error).message}`); }
     });
 
-    mcp.tool('get_config', 'Return full orchestrator config: agents, flows (with steps), and settings.', {}, async () => {
-        try { return ok(await hGetConfig(ctx)); }
-        catch (err) { return ok(`Error: ${(err as Error).message}`); }
+    mcp.tool('get_config', 'Return full orchestrator config: agents, flows, settings.', {}, async () => {
+        try { return ok(await hGetConfig(ctx)); } catch (err) { return ok(`Error: ${(err as Error).message}`); }
+    });
+
+    mcp.tool('save_agent', 'Create or update an agent in the config store.', {
+        agent: z.string().describe('JSON-serialized StoredAgent'),
+    }, async ({ agent }) => {
+        try { return ok(await hSaveAgent(ctx, JSON.parse(agent) as StoredAgent)); }
+        catch (err) { return ok(JSON.stringify({ ok: false, error: (err as Error).message })); }
+    });
+
+    mcp.tool('delete_agent', 'Delete an agent from the config store.', {
+        id: z.string(),
+    }, async ({ id }) => {
+        try { return ok(await hDeleteAgent(ctx, id)); } catch (err) { return ok(`Error: ${(err as Error).message}`); }
+    });
+
+    mcp.tool('save_flow', 'Create or update a flow in the config store.', {
+        flow: z.string().describe('JSON-serialized StoredFlow'),
+    }, async ({ flow }) => {
+        try { return ok(await hSaveFlow(ctx, JSON.parse(flow) as StoredFlow)); }
+        catch (err) { return ok(JSON.stringify({ ok: false, error: (err as Error).message })); }
+    });
+
+    mcp.tool('delete_flow', 'Delete a flow from the config store.', {
+        id: z.string(),
+    }, async ({ id }) => {
+        try { return ok(await hDeleteFlow(ctx, id)); } catch (err) { return ok(`Error: ${(err as Error).message}`); }
     });
 
     const transport = new StdioServerTransport();
     await mcp.connect(transport);
     log(`${config.orchestrator.name} started (stdio)`);
     log(`agents: ${registry.agentIds().join(', ')}`);
-    log(`flows: ${(config.flows ?? []).map(f => f.id).join(', ') || '(none)'}`);
+    log(`flows: ${configStore.listFlows().map(f => f.id).join(', ') || '(none)'}`);
 }
