@@ -1,6 +1,8 @@
-# codex-context-agent
+# codex-context-agent v2
 
 Agente MCP que genera y consulta un vault de conocimiento por proyecto. Analiza código y documentación con un LLM, guarda notas estructuradas en Markdown, y las expone vía búsqueda semántica (RAG).
+
+**v2: embeddings semánticos directamente en Node.js con Transformers.js — sin Ollama, sin dependencias externas.**
 
 Diseñado para conectarse a **Claude Code**, Cursor, Windsurf, o cualquier cliente MCP.
 
@@ -16,7 +18,7 @@ Tus archivos (código / docs / PDFs)
     Notas estructuradas (.md con frontmatter)
         ↓ guardadas en
     ~/.codex-vaults/{nombre-del-repo}/
-        ↓ auto-reindex con nomic-embed-text (Ollama local)
+        ↓ auto-reindex con nomic-embed-text-v1 (Transformers.js, en proceso)
     search_vault("cómo funciona X?")
         ↓
     Top-K resultados por similitud semántica + síntesis automática
@@ -30,10 +32,12 @@ El vault se detecta automáticamente desde el **git root** del proyecto activo. 
 
 ```bash
 # Desde el monorepo backendkit-agents
-cd packages/codex-context-agent
+cd packages/codex-context-agent-v2
 npm install
 npm run build
 ```
+
+El modelo de embeddings (`nomic-embed-text-v1`, ~274MB) se descarga automáticamente en la primera ejecución y queda cacheado en `~/.cache/codex-context/models`. No requiere instalar nada adicional.
 
 ---
 
@@ -60,7 +64,7 @@ Claude Code carga ambos archivos y los fusiona. Nunca commitees `settings.local.
     "codex-context": {
       "command": "node",
       "args": [
-        "/ruta/absoluta/a/packages/codex-context-agent/dist/server.js"
+        "/ruta/absoluta/a/packages/codex-context-agent-v2/dist/server.js"
       ],
       "env": {
         "CODEX_PROJECT_PATH": "/ruta/absoluta/a/tu-proyecto"
@@ -103,8 +107,7 @@ Las claves de `env` en `settings.local.json` se fusionan con las de `settings.js
 | `CODEX_MODEL` | No | Default del proveedor | Modelo específico para curación |
 | `CODEX_BASE_URL` | No | Default del proveedor | Endpoint personalizado del LLM |
 | `CODEX_HTTP_PORT` | No | — | Activa transporte HTTP en ese puerto |
-| `CODEX_OLLAMA_HOST` | No | `http://localhost:11434` | Host de Ollama para embeddings |
-| `CODEX_EMBED_MODEL` | No | `nomic-embed-text` | Modelo de embeddings para RAG |
+| `CODEX_EMBED_MODEL` | No | `Xenova/nomic-embed-text-v1` | Modelo de embeddings (HuggingFace/Xenova) |
 
 ---
 
@@ -123,46 +126,48 @@ Para Ollama no necesitás `CODEX_API_KEY` (podés poner cualquier string).
 
 ## Embeddings semánticos (RAG)
 
-El agente usa **Ollama** con `nomic-embed-text` para convertir texto en vectores numéricos de 768 dimensiones. Esto permite búsqueda semántica real: encontrar notas relevantes aunque la query no comparta palabras exactas con el contenido.
+El agente usa **Transformers.js** (`@xenova/transformers`) para correr `nomic-embed-text-v1` directamente en Node.js sin ningún servidor externo. El modelo convierte texto en vectores de 768 dimensiones que capturan significado semántico.
 
-### Setup requerido
+### Sin setup adicional
 
-```bash
-# 1. Instalar Ollama desde https://ollama.com
-# 2. Descargar el modelo de embeddings
-ollama pull nomic-embed-text
+No necesitás instalar Ollama ni ningún otro runtime. El modelo se descarga automáticamente la primera vez:
 
-# Ollama queda corriendo como servicio en localhost:11434
+```
+Primera ejecución:
+  → modelo descargado desde HuggingFace (~274MB)
+  → cacheado en ~/.cache/codex-context/models/
+  → disponible en todas las sesiones siguientes sin re-descarga
 ```
 
 ### Cómo funciona el índice
 
-**Al curar** (`curate_path`): cada nota generada se embide con `nomic-embed-text` y se agrega al índice en `~/.codex-context/rag/{proyecto}.json`. Esto ocurre automáticamente al terminar el procesamiento en background.
+**Al curar** (`curate_path`): cada nota generada se embide con `nomic-embed-text-v1` y se agrega al índice en `~/.codex-context/rag/{proyecto}.json`. Esto ocurre automáticamente al terminar el procesamiento en background.
 
-**Al buscar** (`search_vault`): la query también se embide con `nomic-embed-text` y se compara contra todos los chunks del índice por similitud coseno. Resultados ordenados por relevancia semántica.
+**Al buscar** (`search_vault`): la query también se embide y se compara contra todos los chunks del índice por similitud coseno. Resultados ordenados por relevancia semántica.
 
 ```
-"cómo se persiste el conocimiento"   →  nomic-embed-text  →  vector Q
-"writeNote() → vault/{area}/.md"     →  nomic-embed-text  →  vector C
+"cómo se persiste el conocimiento"   →  nomic-embed-text-v1  →  vector Q
+"writeNote() → vault/{area}/.md"     →  nomic-embed-text-v1  →  vector C
 cosine_similarity(Q, C) = 0.87       →  resultado relevante ✓
 ```
 
 ### Usar un modelo diferente
+
+Cualquier modelo de embeddings compatible con `@xenova/transformers`:
 
 ```json
 {
   "mcpServers": {
     "codex-context": {
       "env": {
-        "CODEX_EMBED_MODEL": "mxbai-embed-large",
-        "CODEX_OLLAMA_HOST": "http://localhost:11434"
+        "CODEX_EMBED_MODEL": "Xenova/all-MiniLM-L6-v2"
       }
     }
   }
 }
 ```
 
-> Al cambiar `CODEX_EMBED_MODEL`, el índice existente se descarta automáticamente y se reconstruye desde cero en el próximo `vault_status({ reload: true })`.
+> Al cambiar `CODEX_EMBED_MODEL`, el índice existente se descarta automáticamente y se reconstruye desde cero en el próximo reindexado.
 
 ---
 
@@ -177,8 +182,7 @@ El vault se crea automáticamente en:
 ├── frontend/         # Código de frontend
 ├── devops/           # Infraestructura, CI/CD
 ├── infraestructura/  # Cloud, configuración
-├── synthesis/        # Notas sintéticas generadas por search_vault
-└── general/          # Docs curadas (.md, .txt, .pdf)
+└── synthesis/        # Notas sintéticas generadas por search_vault
 ```
 
 Cada nota es un `.md` con frontmatter YAML:
@@ -223,7 +227,7 @@ Comportamiento:
   - Directorio: descubre archivos recursivamente, procesa en background (batches de 10)
   - Usa manifest SHA256 para saltear archivos sin cambios en ejecuciones posteriores
   - Ignora: node_modules, dist, build, .git, .venv, __pycache__
-  - Al terminar, reindexea el vault automáticamente con nomic-embed-text
+  - Al terminar, reindexea el vault automáticamente con nomic-embed-text-v1
 ```
 
 **Ejemplos desde Claude Code:**
@@ -308,7 +312,10 @@ Retorna:
   - projectRoot: directorio raíz del git repo
   - vaultPath: ruta al vault en disco
   - noteCount: cantidad de notas curadas
+  - curating: true si hay una curación en progreso
+  - lastCuratedAt: timestamp del último curado completado
   - engine: estado del índice RAG
+  - claudeMdSuggestion: bloque para pegar en CLAUDE.md (solo si vault vacío)
 ```
 
 **Cuándo usar `reload: true`:** el reindexado ocurre automáticamente después de cada `curate_path`. Usá `reload: true` manualmente si agregaste notas al vault por fuera del agente, o si querés forzar una reconstrucción del índice.
@@ -319,12 +326,14 @@ Retorna:
 
 ```
 1. Setup inicial (una vez)
-   → instalar Ollama + ollama pull nomic-embed-text
+   → npm install && npm run build
    → configurar settings.json y settings.local.json
+   → (sin Ollama ni setup adicional)
 
 2. Abrir el proyecto en Claude Code
    → el agente detecta el git root automáticamente
    → el índice RAG se carga en background (no bloquea el arranque)
+   → primera vez: descarga nomic-embed-text-v1 (~274MB)
 
 3. Primera vez — curar el código base
    → curate_path("/ruta/al/proyecto/src")
@@ -355,7 +364,7 @@ Si querés que el agente esté disponible en cualquier proyecto sin configurar c
   "mcpServers": {
     "codex-context": {
       "command": "node",
-      "args": ["/ruta/a/codex-context-agent/dist/server.js"],
+      "args": ["/ruta/a/codex-context-agent-v2/dist/server.js"],
       "env": {
         "CODEX_API_KEY": "sk-tu-key",
         "CODEX_PROVIDER": "deepseek"
@@ -400,3 +409,17 @@ curl -X POST http://localhost:3200/mcp \
     "id": 1
   }'
 ```
+
+---
+
+## Diferencias con v1
+
+| | v1 | v2 |
+|---|---|---|
+| Embeddings | Ollama (proceso externo) | Transformers.js (en Node.js) |
+| Setup | `ollama pull nomic-embed-text` | Solo `npm install` |
+| Primera ejecución | Manual | Descarga automática |
+| GPU | Sí (vía Ollama) | No (solo CPU) |
+| Memoria | Proceso separado | Compartida con el servidor |
+| `CODEX_OLLAMA_HOST` | Sí | No aplica |
+| `CODEX_EMBED_MODEL` | Nombre Ollama | ID HuggingFace/Xenova |
