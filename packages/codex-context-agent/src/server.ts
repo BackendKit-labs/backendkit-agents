@@ -259,6 +259,22 @@ function createMcpServer(ctx: ProjectContext, engine: KnowledgeEngine, curation:
                     }
                 } catch { /* ignore */ }
 
+                const claudeMdSuggestion = noteCount === 0 ? [
+                    '## Vault de conocimiento (codex-context MCP)',
+                    '',
+                    'Este proyecto tiene un vault activo. Antes de explorar archivos, buscá en el vault:',
+                    '',
+                    '```',
+                    'search_vault("tu pregunta en lenguaje natural")',
+                    '```',
+                    '',
+                    'Flujo recomendado:',
+                    '1. `search_vault(...)` — orientación sobre el área de trabajo',
+                    '2. `read_note("título")` — detalle completo de una nota',
+                    '3. Trabajar en el código',
+                    `4. \`curate_path("archivo modificado")\` — actualizar el vault`,
+                ].join('\n') : undefined;
+
                 return {
                     content: [{
                         type: 'text' as const,
@@ -272,6 +288,7 @@ function createMcpServer(ctx: ProjectContext, engine: KnowledgeEngine, curation:
                             ...(curation.lastCompletedAt ? { lastCuratedAt: curation.lastCompletedAt.toISOString() } : {}),
                             engine: engineStats,
                             ...(reloadResult ? { reindexed: reloadResult } : {}),
+                            ...(claudeMdSuggestion ? { claudeMdSuggestion } : {}),
                         }),
                     }]
                 };
