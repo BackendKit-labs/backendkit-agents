@@ -2,6 +2,7 @@
   "name": "@backendkit-labs/codex-context-agent",
   "version": "0.1.0",
   "description": "Codex Context Agent — per-project knowledge vault MCP server for AI coding agents (Claude Code, Cursor, Windsurf).",
+  "type": "module",
   "main": "dist/server.js",
   "bin": {
     "codex-context-agent": "./dist/server.js"

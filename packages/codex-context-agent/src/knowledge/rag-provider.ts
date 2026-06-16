@@ -51,22 +51,23 @@ export class CuratorRagProvider {
         }
 
         try {
-            const results = await this.rag.search(query, {
-                topK: opts.topK || 5,
-                minScore: opts.minScore || 0.1,
-            });
+            // ObsidianRAGProvider.search() returns a formatted string, not an array.
+            // Access the underlying store and embedder directly for structured results.
+            const rag = this.rag as any;
+            const queryEmbedding = await rag.embedder.embedOne(query);
+            const topK = opts.topK ?? 5;
+            const minScore = opts.minScore ?? 0.1;
+            const rawResults: { chunk: any; score: number }[] = rag.store.search(queryEmbedding, topK);
 
-            if (!Array.isArray(results)) {
-                return [];
-            }
-
-            return results.map((r: any) => ({
-                title: r.title || 'Untitled',
-                content: r.content || r.text || '',
-                relevance: r.score || r.relevance || 0,
-                sourcePath: r.path || r.source || '',
-                sourceRef: r.sourceRef || undefined,
-            }));
+            return rawResults
+                .filter(r => r.score >= minScore)
+                .map(({ chunk, score }) => ({
+                    title: chunk.title || 'Untitled',
+                    content: chunk.text || '',
+                    relevance: score,
+                    sourcePath: chunk.filePath || '',
+                    sourceRef: chunk.metadata?.sourceRef || undefined,
+                }));
         } catch (err) {
             throw new Error(`RAG search failed: ${(err as Error).message}`);
         }

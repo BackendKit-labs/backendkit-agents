@@ -354,9 +354,15 @@ export async function dispatch(ctx: HandlerCtx, name: string, args: Record<strin
         case 'list_agents_json':     return hListAgentsJson(ctx);
         case 'list_runs':            return hListRuns(ctx);
         case 'get_config':           return hGetConfig(ctx);
-        case 'save_agent':           return hSaveAgent(ctx, args['agent'] as StoredAgent);
+        case 'save_agent': {
+            const a = typeof args['agent'] === 'string' ? JSON.parse(args['agent']) : args['agent'];
+            return hSaveAgent(ctx, a as StoredAgent);
+        }
         case 'delete_agent':         return hDeleteAgent(ctx, String(args['id'] ?? ''));
-        case 'save_flow':            return hSaveFlow(ctx, args['flow'] as StoredFlow);
+        case 'save_flow': {
+            const f = typeof args['flow'] === 'string' ? JSON.parse(args['flow']) : args['flow'];
+            return hSaveFlow(ctx, f as StoredFlow);
+        }
         case 'delete_flow':          return hDeleteFlow(ctx, String(args['id'] ?? ''));
         default: throw new Error(`Unknown tool: ${name}`);
     }
