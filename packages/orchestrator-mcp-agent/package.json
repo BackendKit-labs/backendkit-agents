@@ -20,13 +20,16 @@
   "dependencies": {
     "@backendkit-labs/agent-enterprise": "^0.4.0",
     "@backendkit-labs/agent-protocol": "^0.2.0",
+    "@kubernetes/client-node": "^1.4.0",
     "@modelcontextprotocol/sdk": "^1.12.0",
     "@types/better-sqlite3": "^7.6.13",
     "better-sqlite3": "^12.11.1",
+    "dockerode": "^4.0.12",
     "yaml": "^2.4.0",
     "zod": "^3.25.0"
   },
   "devDependencies": {
+    "@types/dockerode": "^3.3.47",
     "@types/node": "^20.17.12",
     "typescript": "^5.7.3"
   },

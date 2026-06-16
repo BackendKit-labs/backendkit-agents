@@ -29,6 +29,9 @@ import { loadFlow }       from './flow.js';
 import { RunStore }       from './run-store.js';
 import { ConfigStore }    from './config-store.js';
 import type { StoredAgent, StoredFlow } from './config-store.js';
+import { DockerRuntime }     from './runtime.js';
+import { KubernetesRuntime } from './k8s-runtime.js';
+import type { DeploySpec, AgentRuntime } from './runtime.js';
 import {
     type HandlerCtx,
     dispatch,
@@ -89,6 +92,31 @@ const ctx: HandlerCtx = { config, configDir, executor, store, registry, configSt
 
 const log = (msg: string) => process.stderr.write(`[orchestrator-mcp-agent] ${msg}\n`);
 
+// ── Docker runtime (optional — only used when Docker is available) ─────────────
+
+// DEPLOY_RUNTIME=kubernetes → KubernetesRuntime, default → DockerRuntime
+// K8s options via env: K8S_NAMESPACE, K8S_SERVICE_TYPE (NodePort|LoadBalancer|ClusterIP),
+//                      K8S_NODE_HOST, K8S_IN_CLUSTER=true
+
+let dockerRuntime: AgentRuntime | null = null;
+try {
+    const runtimeType = process.env['DEPLOY_RUNTIME'] ?? 'docker';
+    if (runtimeType === 'kubernetes') {
+        dockerRuntime = new KubernetesRuntime({
+            namespace:   process.env['K8S_NAMESPACE']    ?? 'mcp-agents',
+            serviceType: (process.env['K8S_SERVICE_TYPE'] as 'NodePort' | 'LoadBalancer' | 'ClusterIP') ?? 'NodePort',
+            nodeHost:    process.env['K8S_NODE_HOST']    ?? 'localhost',
+            inCluster:   process.env['K8S_IN_CLUSTER']  === 'true',
+        });
+        log('deploy runtime: kubernetes');
+    } else {
+        dockerRuntime = new DockerRuntime();
+        log('deploy runtime: docker');
+    }
+} catch (e) {
+    log(`deploy runtime unavailable: ${(e as Error).message} — /v1/deploy endpoints disabled`);
+}
+
 // ── HTTP mode ─────────────────────────────────────────────────────────────────
 
 const HTTP_PORT = process.env['ORCHESTRATOR_HTTP_PORT'];
@@ -142,6 +170,68 @@ if (HTTP_PORT) {
                 const result = JSON.parse(await hStartFlow(ctx, body.flow_id, body.input ?? {})) as { run_id?: string; error?: string };
                 return send(result.error ? 400 : 202, result);
             } catch { return send(400, { error: 'Invalid JSON body' }); }
+        }
+
+        // ── Deploy (Docker runtime) ───────────────────────────────────────────
+
+        if (url.startsWith('/v1/deploy')) {
+            if (!dockerRuntime) return send(503, { error: 'Docker runtime not available' });
+
+            // GET /v1/deploy — list managed containers
+            if (req.method === 'GET' && url === '/v1/deploy') {
+                try { return send(200, await dockerRuntime.list()); }
+                catch (e) { return send(500, { error: (e as Error).message }); }
+            }
+
+            // POST /v1/deploy — deploy a new agent container + register in pool
+            if (req.method === 'POST' && url === '/v1/deploy') {
+                let spec: DeploySpec;
+                try { spec = await readBody() as DeploySpec; }
+                catch { return send(400, { error: 'Invalid JSON body' }); }
+
+                if (!spec.id)    return send(400, { error: 'id is required' });
+                if (!spec.image) return send(400, { error: 'image is required' });
+
+                try {
+                    const { url: agentUrl, instanceId } = await dockerRuntime.deploy(spec);
+
+                    // Persist in ConfigStore + hot-reload pool
+                    const stored: StoredAgent = {
+                        id:          spec.id,
+                        description: spec.description ?? spec.image,
+                        transport:   'http',
+                        strategy:    spec.strategy ?? 'round-robin',
+                        capability:  spec.capability ?? 'execute',
+                        gate:        false,
+                        timeout:     undefined,
+                        instances:   [{ url: agentUrl, ...(spec.apiKey ? { apiKey: spec.apiKey } : {}) }],
+                    };
+                    configStore.saveAgent(stored);
+                    registry.upsertAgent(stored);
+
+                    log(`deployed ${spec.id} → ${agentUrl} (${instanceId})`);
+                    return send(201, { ok: true, agentId: spec.id, instanceId, url: agentUrl });
+                } catch (e) {
+                    return send(500, { error: (e as Error).message });
+                }
+            }
+
+            // DELETE /v1/deploy/:agentId — stop container + unregister
+            if (req.method === 'DELETE' && url.startsWith('/v1/deploy/')) {
+                const agentId = decodeURIComponent(url.slice('/v1/deploy/'.length));
+                if (!agentId) return send(400, { error: 'agentId is required' });
+
+                try {
+                    await dockerRuntime.stopByAgentId(agentId);
+                    configStore.deleteAgent(agentId);
+                    registry.removeAgent(agentId);
+
+                    log(`undeployed ${agentId}`);
+                    return send(200, { ok: true, agentId });
+                } catch (e) {
+                    return send(500, { error: (e as Error).message });
+                }
+            }
         }
 
         // ── Generic tool call ─────────────────────────────────────────────────
