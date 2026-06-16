@@ -91,6 +91,9 @@ function createMcpServer(ctx: ProjectContext, engine: KnowledgeEngine): McpServe
 
                 if (stat.isFile()) {
                     const result = await analyzer.analyzeFile(targetPath, targetPath);
+                    engine.reload()
+                        .then(() => log('✓ Vault reindexed after single-file curation'))
+                        .catch(err => log(`⚠ Auto-reindex failed: ${(err as Error).message}`));
                     return { content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
                 }
 
@@ -108,7 +111,7 @@ function createMcpServer(ctx: ProjectContext, engine: KnowledgeEngine): McpServe
                 const codeCount = files.filter(f => /\.(ts|tsx|js|jsx|py|go|rs|java|c|cpp|kt|swift)$/.test(f.relativePath)).length;
                 const docCount  = files.filter(f => /\.(md|txt)$/.test(f.relativePath)).length;
 
-                // Process in background without blocking
+                // Process in background without blocking, then auto-reindex
                 (async () => {
                     const batchSize = 10;
                     for (let i = 0; i < files.length; i += batchSize) {
@@ -121,6 +124,12 @@ function createMcpServer(ctx: ProjectContext, engine: KnowledgeEngine): McpServe
                         );
                     }
                     log(`✓ Curated ${files.length} files from ${targetPath}`);
+                    try {
+                        await engine.reload();
+                        log('✓ Vault reindexed automatically');
+                    } catch (err) {
+                        log(`⚠ Auto-reindex failed: ${(err as Error).message}`);
+                    }
                 })();
 
                 return {
@@ -327,16 +336,11 @@ async function main(): Promise<void> {
     log(`Vault:    ${ctx.vaultPath}`);
     log(`Provider: ${process.env.CODEX_PROVIDER || 'deepseek'} / ${process.env.CODEX_MODEL || 'default model'}`);
 
-    // Initialize knowledge engine (RAG indexing, lazy — won't fail startup)
+    // Initialize knowledge engine — index in background so startup is not blocked
     const engine = new KnowledgeEngine(makeProvider(), ctx.vaultPath);
-    try {
-        log('Indexing vault...');
-        await engine.initialize();
-        log('✓ Vault indexed');
-    } catch (err) {
-        log(`⚠ Vault indexing skipped: ${(err as Error).message}`);
-        log('  (curate_path will work; search_vault will index on first call)');
-    }
+    engine.initialize()
+        .then(() => log('✓ Vault indexed'))
+        .catch(err => log(`⚠ Vault indexing skipped: ${(err as Error).message}`));
 
     // Stdio (always active)
     await startStdio(ctx, engine);
