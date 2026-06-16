@@ -1,5 +1,21 @@
 # backendkit-agents — Contexto del proyecto
 
+## Vault de conocimiento — leer primero
+
+Este proyecto tiene un vault activo con notas curadas del código y la documentación. **Antes de explorar archivos o hacer greps, buscá en el vault:**
+
+```
+search_vault("tu pregunta en lenguaje natural")
+```
+
+Flujo en cada sesión:
+1. `search_vault(...)` — orientación rápida sobre el área de trabajo
+2. `read_note("título")` — detalle completo de una nota específica
+3. Trabajar en el código
+4. `curate_path("archivo modificado")` — actualizar el vault después de cambios
+
+El vault persiste entre sesiones y se reindexea automáticamente después de cada `curate_path`. Solo usá `vault_status({ reload: true })` si agregaste notas manualmente o necesitás forzar una reconstrucción.
+
 ## Qué es este repo
 
 Monorepo de agentes MCP (Model Context Protocol) para la plataforma BackendKit. Cada paquete en `packages/` es un servidor MCP independiente.
@@ -48,18 +64,10 @@ Está en `packages/codex-context-agent/docs/` — 9 archivos .md con:
 - `project-detection.md` — detección de git root
 - `workflows.md` — patrones de uso
 
-### Tarea pendiente
-Curar los docs del agente para poblar el vault. Usar:
-```
-curate_path("C:\Users\mairon.cuello\development\workspace-ia\backendkit-agents\packages\codex-context-agent\docs")
-```
-Luego: `vault_status({ reload: true })` para reindexar.
-
-## Cambios sin commitear (pre-existentes)
-
-Hay dos archivos modificados que no son parte del trabajo reciente:
-- `packages/curator-codex-agent/src/knowledge/rag-provider.ts` — fix: array check en search results
-- `packages/orchestrator-mcp-agent/src/handlers.ts` — fix: parse JSON string en save_agent/save_flow
+### Estado del vault
+- 45+ notas curadas: docs de `packages/codex-context-agent/docs/` + código de `src/`
+- Embeddings: `nomic-embed-text` vía Ollama (semántico real, no TF-IDF)
+- Índice: `~/.codex-context/rag/backendkit-agents.json`
 
 ## Comandos útiles
 
@@ -78,7 +86,7 @@ npm run build
 
 - TypeScript + NodeNext modules
 - MCP SDK: `@modelcontextprotocol/sdk`
-- RAG: `@backendkit-labs/agent-enterprise` (ObsidianRAGProvider + SimpleEmbedder)
+- RAG: `@backendkit-labs/agent-enterprise` (ObsidianRAGProvider + OllamaEmbedder / nomic-embed-text)
 - LLM adapters: OpenAI-compatible + Anthropic SDK
 - PDF: `pdf-parse` v2 con `pdfjs-dist`
 - Transporte: stdio (siempre) + HTTP opcional (StreamableHTTPServerTransport)
