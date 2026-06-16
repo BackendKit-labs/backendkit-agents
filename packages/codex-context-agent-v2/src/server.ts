@@ -26,6 +26,8 @@
 import 'dotenv/config';
 import * as http from 'node:http';
 import * as fs   from 'node:fs/promises';
+import * as path from 'node:path';
+import * as os   from 'node:os';
 
 import { McpServer }                     from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport }          from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -303,7 +305,108 @@ function createMcpServer(ctx: ProjectContext, engine: KnowledgeEngine, curation:
         },
     );
 
+    // ── clone_vault ──────────────────────────────────────────────────────────
+
+    t(
+        'clone_vault',
+        'Copy notes from an existing curated vault into the current project vault. ' +
+        'Preserves the source directory structure and merges into the active vault. ' +
+        'Files that already exist are skipped by default (set overwrite: true to replace them). ' +
+        'Triggers an automatic reindex after copying. ' +
+        'Useful for seeding a new project with a shared knowledge base (e.g. an AI/LLM theory vault).',
+        {
+            sourcePath: z.string().describe(
+                'Absolute path to the source vault directory. ' +
+                'Supports ~ expansion. Example: "~/.codex-vaults/ia-knowledge"'
+            ),
+            overwrite: z.boolean().optional().describe('Replace notes that already exist in the target vault (default: false)'),
+        },
+        async ({ sourcePath, overwrite = false }: { sourcePath: string; overwrite?: boolean }) => {
+            try {
+                const expandedSource = sourcePath.startsWith('~')
+                    ? path.join(os.homedir(), sourcePath.slice(1))
+                    : sourcePath;
+
+                const stat = await fs.stat(expandedSource).catch(() => null);
+                if (!stat?.isDirectory()) {
+                    return {
+                        content: [{
+                            type: 'text' as const,
+                            text: JSON.stringify({ error: `Source vault not found or not a directory: ${expandedSource}` }),
+                        }]
+                    };
+                }
+
+                const { copied, skipped } = await cloneVaultDir(expandedSource, ctx.vaultPath, overwrite);
+
+                // Auto-reindex after clone
+                curation.activeJobs++;
+                engine.reload()
+                    .then(() => log('✓ Vault reindexed after clone'))
+                    .catch(err => log(`⚠ Auto-reindex failed: ${(err as Error).message}`))
+                    .finally(() => { curation.activeJobs--; curation.lastCompletedAt = new Date(); });
+
+                return {
+                    content: [{
+                        type: 'text' as const,
+                        text: JSON.stringify({
+                            status: 'cloned',
+                            sourcePath: expandedSource,
+                            targetVault: ctx.vaultPath,
+                            copied,
+                            skipped,
+                            totalNotes: copied + skipped,
+                            reindexing: true,
+                        }),
+                    }]
+                };
+            } catch (err) {
+                return {
+                    content: [{
+                        type: 'text' as const,
+                        text: JSON.stringify({ error: (err as Error).message }),
+                    }]
+                };
+            }
+        },
+    );
+
     return srv;
+}
+
+// ── clone_vault helper ────────────────────────────────────────────────────────
+
+async function cloneVaultDir(
+    srcDir: string,
+    destDir: string,
+    overwrite: boolean,
+): Promise<{ copied: number; skipped: number }> {
+    let copied = 0;
+    let skipped = 0;
+
+    await fs.mkdir(destDir, { recursive: true });
+    const entries = await fs.readdir(srcDir, { withFileTypes: true });
+
+    for (const entry of entries) {
+        const srcPath  = path.join(srcDir,  entry.name);
+        const destPath = path.join(destDir, entry.name);
+
+        if (entry.isDirectory()) {
+            const sub = await cloneVaultDir(srcPath, destPath, overwrite);
+            copied  += sub.copied;
+            skipped += sub.skipped;
+        } else if (entry.isFile() && entry.name.endsWith('.md')) {
+            const exists = await fs.access(destPath).then(() => true).catch(() => false);
+            if (exists && !overwrite) {
+                skipped++;
+            } else {
+                await fs.copyFile(srcPath, destPath);
+                copied++;
+            }
+        }
+    }
+
+    return { copied, skipped };
 }
 
 // ── Transports ────────────────────────────────────────────────────────────────
