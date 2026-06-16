@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "codex-context": {
+      "command": "node",
+      "args": [
+        "C:\\Users\\mairon.cuello\\development\\workspace-ia\\backendkit-agents\\packages\\codex-context-agent\\dist\\server.js"
+      ],
+      "env": {
+        "CODEX_PROJECT_PATH": "C:\\Users\\mairon.cuello\\development\\workspace-ia\\backendkit-agents"
+      }
+    }
+  }
+}
