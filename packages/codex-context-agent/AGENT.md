@@ -16,13 +16,13 @@ Tus archivos (código / docs / PDFs)
     Notas estructuradas (.md con frontmatter)
         ↓ guardadas en
     ~/.codex-vaults/{nombre-del-repo}/
-        ↓ indexadas con embeddings
+        ↓ auto-reindex con nomic-embed-text (Ollama local)
     search_vault("cómo funciona X?")
         ↓
-    Top-K resultados + síntesis automática
+    Top-K resultados por similitud semántica + síntesis automática
 ```
 
-El vault se detecta automáticamente desde el **git root** del proyecto activo. No requiere configuración por proyecto más allá de la API key.
+El vault se detecta automáticamente desde el **git root** del proyecto activo. No requiere configuración por proyecto más allá de la API key. Después de cada `curate_path`, el vault se reindexea automáticamente.
 
 ---
 
@@ -99,10 +99,12 @@ Las claves de `env` en `settings.local.json` se fusionan con las de `settings.js
 |---|---|---|---|
 | `CODEX_API_KEY` | Sí | — | API key del proveedor LLM |
 | `CODEX_PROJECT_PATH` | No | CWD del proceso | Raíz del proyecto (fija el vault) |
-| `CODEX_PROVIDER` | No | `deepseek` | Proveedor LLM |
-| `CODEX_MODEL` | No | Default del proveedor | Modelo específico |
-| `CODEX_BASE_URL` | No | Default del proveedor | Endpoint personalizado |
+| `CODEX_PROVIDER` | No | `deepseek` | Proveedor LLM para curación |
+| `CODEX_MODEL` | No | Default del proveedor | Modelo específico para curación |
+| `CODEX_BASE_URL` | No | Default del proveedor | Endpoint personalizado del LLM |
 | `CODEX_HTTP_PORT` | No | — | Activa transporte HTTP en ese puerto |
+| `CODEX_OLLAMA_HOST` | No | `http://localhost:11434` | Host de Ollama para embeddings |
+| `CODEX_EMBED_MODEL` | No | `nomic-embed-text` | Modelo de embeddings para RAG |
 
 ---
 
@@ -116,6 +118,51 @@ Las claves de `env` en `settings.local.json` se fusionan con las de `settings.js
 | `ollama` | `qwen2.5-coder:7b` | Local, sin costo, requiere Ollama corriendo |
 
 Para Ollama no necesitás `CODEX_API_KEY` (podés poner cualquier string).
+
+---
+
+## Embeddings semánticos (RAG)
+
+El agente usa **Ollama** con `nomic-embed-text` para convertir texto en vectores numéricos de 768 dimensiones. Esto permite búsqueda semántica real: encontrar notas relevantes aunque la query no comparta palabras exactas con el contenido.
+
+### Setup requerido
+
+```bash
+# 1. Instalar Ollama desde https://ollama.com
+# 2. Descargar el modelo de embeddings
+ollama pull nomic-embed-text
+
+# Ollama queda corriendo como servicio en localhost:11434
+```
+
+### Cómo funciona el índice
+
+**Al curar** (`curate_path`): cada nota generada se embide con `nomic-embed-text` y se agrega al índice en `~/.codex-context/rag/{proyecto}.json`. Esto ocurre automáticamente al terminar el procesamiento en background.
+
+**Al buscar** (`search_vault`): la query también se embide con `nomic-embed-text` y se compara contra todos los chunks del índice por similitud coseno. Resultados ordenados por relevancia semántica.
+
+```
+"cómo se persiste el conocimiento"   →  nomic-embed-text  →  vector Q
+"writeNote() → vault/{area}/.md"     →  nomic-embed-text  →  vector C
+cosine_similarity(Q, C) = 0.87       →  resultado relevante ✓
+```
+
+### Usar un modelo diferente
+
+```json
+{
+  "mcpServers": {
+    "codex-context": {
+      "env": {
+        "CODEX_EMBED_MODEL": "mxbai-embed-large",
+        "CODEX_OLLAMA_HOST": "http://localhost:11434"
+      }
+    }
+  }
+}
+```
+
+> Al cambiar `CODEX_EMBED_MODEL`, el índice existente se descarta automáticamente y se reconstruye desde cero en el próximo `vault_status({ reload: true })`.
 
 ---
 
@@ -176,6 +223,7 @@ Comportamiento:
   - Directorio: descubre archivos recursivamente, procesa en background (batches de 10)
   - Usa manifest SHA256 para saltear archivos sin cambios en ejecuciones posteriores
   - Ignora: node_modules, dist, build, .git, .venv, __pycache__
+  - Al terminar, reindexea el vault automáticamente con nomic-embed-text
 ```
 
 **Ejemplos desde Claude Code:**
@@ -263,22 +311,24 @@ Retorna:
   - engine: estado del índice RAG
 ```
 
-**Cuándo usar `reload: true`:** después de que `curate_path` termina el procesamiento en background, llamá `vault_status({ reload: true })` para que las nuevas notas queden disponibles en `search_vault`.
+**Cuándo usar `reload: true`:** el reindexado ocurre automáticamente después de cada `curate_path`. Usá `reload: true` manualmente si agregaste notas al vault por fuera del agente, o si querés forzar una reconstrucción del índice.
 
 ---
 
 ## Flujo típico de uso
 
 ```
-1. Abrir el proyecto en Claude Code
+1. Setup inicial (una vez)
+   → instalar Ollama + ollama pull nomic-embed-text
+   → configurar settings.json y settings.local.json
+
+2. Abrir el proyecto en Claude Code
    → el agente detecta el git root automáticamente
+   → el índice RAG se carga en background (no bloquea el arranque)
 
-2. Primera vez — curar el código base
+3. Primera vez — curar el código base
    → curate_path("/ruta/al/proyecto/src")
-   → esperar que el background processing termine (1-60 min según tamaño)
-
-3. Reindexar el vault
-   → vault_status({ reload: true })
+   → procesa en background + reindexea automáticamente al terminar
 
 4. Consultar durante el desarrollo
    → search_vault("¿cómo se valida un token JWT?")
@@ -286,7 +336,7 @@ Retorna:
 
 5. Curar archivos nuevos o modificados
    → curate_path("/ruta/al/archivo-nuevo.ts")
-   → vault_status({ reload: true })
+   → el reindexado ocurre automáticamente
 ```
 
 ---
