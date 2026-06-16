@@ -1,4 +1,4 @@
-import { ObsidianRAGProvider, SimpleEmbedder } from '@backendkit-labs/agent-enterprise';
+import { ObsidianRAGProvider, OllamaEmbedder } from '@backendkit-labs/agent-enterprise';
 import * as path from 'node:path';
 import * as os from 'node:os';
 
@@ -25,7 +25,10 @@ export class CuratorRagProvider {
         this.rag = new ObsidianRAGProvider({
             vaultPath,
             indexPath: this.getIndexPath(),
-            embedder: new SimpleEmbedder(),
+            embedder: new OllamaEmbedder({
+                host: process.env.CODEX_OLLAMA_HOST,
+                model: process.env.CODEX_EMBED_MODEL ?? 'nomic-embed-text',
+            }),
             topK: 5,
             minScore: 0.1,
         });
