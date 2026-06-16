@@ -175,6 +175,14 @@ if (HTTP_PORT) {
         // ── Deploy (Docker runtime) ───────────────────────────────────────────
 
         if (url.startsWith('/v1/deploy')) {
+            // GET /v1/deploy/settings — vault path + runtime config (no docker required)
+            if (req.method === 'GET' && url === '/v1/deploy/settings') {
+                return send(200, {
+                    vaultHostPath: process.env['VAULT_HOST_PATH'] ?? null,
+                    runtime:       process.env['DEPLOY_RUNTIME']  ?? 'docker',
+                });
+            }
+
             if (!dockerRuntime) return send(503, { error: 'Docker runtime not available' });
 
             // GET /v1/deploy — list managed containers
@@ -183,7 +191,7 @@ if (HTTP_PORT) {
                 catch (e) { return send(500, { error: (e as Error).message }); }
             }
 
-            // POST /v1/deploy — deploy a new agent container + register in pool
+            // POST /v1/deploy — deploy agent container(s) + register in pool
             if (req.method === 'POST' && url === '/v1/deploy') {
                 let spec: DeploySpec;
                 try { spec = await readBody() as DeploySpec; }
@@ -193,9 +201,9 @@ if (HTTP_PORT) {
                 if (!spec.image) return send(400, { error: 'image is required' });
 
                 try {
-                    const { url: agentUrl, instanceId } = await dockerRuntime.deploy(spec);
+                    const { url: agentUrl, instanceId, replicas } = await dockerRuntime.deploy(spec);
 
-                    // Persist in ConfigStore + hot-reload pool
+                    // Persist in ConfigStore + hot-reload pool (all replicas as instances)
                     const stored: StoredAgent = {
                         id:          spec.id,
                         description: spec.description ?? spec.image,
@@ -204,19 +212,20 @@ if (HTTP_PORT) {
                         capability:  spec.capability ?? 'execute',
                         gate:        false,
                         timeout:     undefined,
-                        instances:   [{ url: agentUrl, ...(spec.apiKey ? { apiKey: spec.apiKey } : {}) }],
+                        image:       spec.image,
+                        instances:   replicas.map(r => ({ url: r.url, ...(spec.apiKey ? { apiKey: spec.apiKey } : {}) })),
                     };
                     configStore.saveAgent(stored);
                     registry.upsertAgent(stored);
 
-                    log(`deployed ${spec.id} → ${agentUrl} (${instanceId})`);
-                    return send(201, { ok: true, agentId: spec.id, instanceId, url: agentUrl });
+                    log(`deployed ${spec.id} × ${replicas.length} → ${agentUrl} (${instanceId})`);
+                    return send(201, { ok: true, agentId: spec.id, instanceId, url: agentUrl, replicas });
                 } catch (e) {
                     return send(500, { error: (e as Error).message });
                 }
             }
 
-            // DELETE /v1/deploy/:agentId — stop container + unregister
+            // DELETE /v1/deploy/:agentId — stop all containers + unregister
             if (req.method === 'DELETE' && url.startsWith('/v1/deploy/')) {
                 const agentId = decodeURIComponent(url.slice('/v1/deploy/'.length));
                 if (!agentId) return send(400, { error: 'agentId is required' });

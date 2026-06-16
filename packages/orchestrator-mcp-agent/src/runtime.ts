@@ -6,6 +6,7 @@ import * as os    from 'node:os';
 export interface DeploySpec {
     id:             string;
     image:          string;
+    name?:          string;          // custom container name prefix (default: id)
     containerPort?: number;          // port the agent listens on inside the container (default 8080)
     env?:           Record<string, string>;
     memoryMb?:      number;
@@ -14,6 +15,8 @@ export interface DeploySpec {
     description?:   string;
     strategy?:      string;
     capability?:    string;
+    instances?:     number;          // number of replicas to run (default 1)
+    mounts?:        string[];        // bind mounts: ["hostPath:containerPath[:ro]", ...]
 }
 
 export interface RunningInstance {
@@ -23,10 +26,17 @@ export interface RunningInstance {
     url:        string;
     status:     string;              // 'running' | 'exited' | ...
     createdAt:  string;              // ISO timestamp
+    replica?:   number;              // replica index (1-based) when instances > 1
+}
+
+export interface DeployResult {
+    url:        string;              // primary instance URL
+    instanceId: string;              // primary instance ID
+    replicas:   Array<{ instanceId: string; url: string }>;
 }
 
 export interface AgentRuntime {
-    deploy(spec: DeploySpec):          Promise<{ url: string; instanceId: string }>;
+    deploy(spec: DeploySpec):          Promise<DeployResult>;
     stopByAgentId(agentId: string):    Promise<void>;
     list():                            Promise<RunningInstance[]>;
 }
@@ -35,6 +45,7 @@ export interface AgentRuntime {
 
 const LABEL_PLATFORM = 'mcp.platform';
 const LABEL_AGENT_ID = 'mcp.agent.id';
+const LABEL_REPLICA  = 'mcp.replica';
 
 // ── DockerRuntime ──────────────────────────────────────────────────────────────
 
@@ -57,49 +68,61 @@ export class DockerRuntime implements AgentRuntime {
 
     // ── deploy ─────────────────────────────────────────────────────────────────
 
-    async deploy(spec: DeploySpec): Promise<{ url: string; instanceId: string }> {
+    async deploy(spec: DeploySpec): Promise<DeployResult> {
         const containerPort = spec.containerPort ?? 8080;
-        const containerName = `mcp-agent-${spec.id}`;
+        const replicaCount  = Math.max(1, spec.instances ?? 1);
+        const namePrefix    = `mcp-agent-${spec.name ?? spec.id}`;
 
         const env: string[] = Object.entries(spec.env ?? {}).map(([k, v]) => `${k}=${v}`);
         if (spec.apiKey) env.push(`AGENT_API_KEY=${spec.apiKey}`);
 
         await this._pullIfMissing(spec.image);
-        await this._removeExisting(containerName);
 
-        const container = await this.docker.createContainer({
-            name:  containerName,
-            Image: spec.image,
-            Env:   env.length ? env : undefined,
-            Labels: {
-                [LABEL_PLATFORM]: 'true',
-                [LABEL_AGENT_ID]: spec.id,
-            },
-            ExposedPorts: { [`${containerPort}/tcp`]: {} },
-            HostConfig: {
-                // HostPort: '' → Docker auto-assigns a free port from the ephemeral range
-                PortBindings: { [`${containerPort}/tcp`]: [{ HostPort: '' }] },
-                RestartPolicy: { Name: 'unless-stopped' },
-                ...(spec.memoryMb && { Memory: spec.memoryMb * 1024 * 1024 }),
-                ...(spec.cpus     && { NanoCpus: Math.round(spec.cpus * 1e9) }),
-            },
-        });
+        // Remove ALL existing containers for this agent before creating new ones
+        await this.stopByAgentId(spec.id);
 
-        await container.start();
+        const replicas: Array<{ instanceId: string; url: string }> = [];
 
-        const info     = await container.inspect();
-        const bindings = info.NetworkSettings.Ports[`${containerPort}/tcp`];
-        if (!bindings?.[0]) {
-            await container.stop({ t: 2 }).catch(() => {});
-            await container.remove({ force: true }).catch(() => {});
-            throw new Error(`Container started but port ${containerPort}/tcp has no host binding`);
+        for (let i = 1; i <= replicaCount; i++) {
+            const containerName = replicaCount === 1 ? namePrefix : `${namePrefix}-${i}`;
+
+            const container = await this.docker.createContainer({
+                name:  containerName,
+                Image: spec.image,
+                Env:   env.length ? env : undefined,
+                Labels: {
+                    [LABEL_PLATFORM]: 'true',
+                    [LABEL_AGENT_ID]: spec.id,
+                    [LABEL_REPLICA]:  String(i),
+                },
+                ExposedPorts: { [`${containerPort}/tcp`]: {} },
+                HostConfig: {
+                    // HostPort: '' → Docker auto-assigns a free port from the ephemeral range
+                    PortBindings: { [`${containerPort}/tcp`]: [{ HostPort: '' }] },
+                    RestartPolicy: { Name: 'unless-stopped' },
+                    ...(spec.memoryMb                && { Memory:   spec.memoryMb * 1024 * 1024 }),
+                    ...(spec.cpus                    && { NanoCpus: Math.round(spec.cpus * 1e9) }),
+                    ...((spec.mounts?.length ?? 0) > 0 && { Binds: spec.mounts }),
+                },
+            });
+
+            await container.start();
+
+            const info     = await container.inspect();
+            const bindings = info.NetworkSettings.Ports[`${containerPort}/tcp`];
+            if (!bindings?.[0]) {
+                await container.stop({ t: 2 }).catch(() => {});
+                await container.remove({ force: true }).catch(() => {});
+                throw new Error(`Container ${containerName} started but port ${containerPort}/tcp has no host binding`);
+            }
+
+            replicas.push({
+                instanceId: info.Id.slice(0, 12),
+                url:        `http://localhost:${bindings[0].HostPort}`,
+            });
         }
 
-        const hostPort = bindings[0].HostPort;
-        return {
-            url:        `http://localhost:${hostPort}`,
-            instanceId: info.Id.slice(0, 12),
-        };
+        return { url: replicas[0].url, instanceId: replicas[0].instanceId, replicas };
     }
 
     // ── stopByAgentId ─────────────────────────────────────────────────────────
@@ -159,6 +182,7 @@ export class DockerRuntime implements AgentRuntime {
         });
     }
 
+    // kept for internal use if ever needed by name
     private async _removeExisting(containerName: string): Promise<void> {
         try {
             const c    = this.docker.getContainer(containerName);

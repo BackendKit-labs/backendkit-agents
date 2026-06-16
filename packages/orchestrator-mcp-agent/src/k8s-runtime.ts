@@ -1,5 +1,5 @@
 import * as k8s from '@kubernetes/client-node';
-import type { DeploySpec, RunningInstance, AgentRuntime } from './runtime.js';
+import type { DeploySpec, RunningInstance, AgentRuntime, DeployResult } from './runtime.js';
 
 // ── Label constants (must match runtime.ts) ───────────────────────────────────
 
@@ -45,7 +45,7 @@ export class KubernetesRuntime implements AgentRuntime {
 
     // ── deploy ─────────────────────────────────────────────────────────────────
 
-    async deploy(spec: DeploySpec): Promise<{ url: string; instanceId: string }> {
+    async deploy(spec: DeploySpec): Promise<DeployResult> {
         const containerPort = spec.containerPort ?? 8080;
         const name          = this._resourceName(spec.id);
 
@@ -65,7 +65,7 @@ export class KubernetesRuntime implements AgentRuntime {
         const svc = await this._applyService({ name, containerPort, labels });
         const url = this._urlFromService(svc, containerPort);
 
-        return { url, instanceId: name };
+        return { url, instanceId: name, replicas: [{ instanceId: name, url }] };
     }
 
     // ── stopByAgentId ─────────────────────────────────────────────────────────
@@ -136,19 +136,34 @@ export class KubernetesRuntime implements AgentRuntime {
     }): Promise<void> {
         const { name, image, containerPort, envVars, labels, spec } = p;
 
+        // Parse mounts: "hostPath:containerPath[:mode]" → K8s hostPath volumes
+        const volumes: k8s.V1Volume[]      = [];
+        const volumeMounts: k8s.V1VolumeMount[] = [];
+        (spec.mounts ?? []).forEach((m, idx) => {
+            const parts      = m.split(':');
+            const hostPath   = parts[0];
+            const mountPath  = parts[1] ?? '/data';
+            const readOnly   = parts[2] === 'ro';
+            const volName    = `vol-${idx}`;
+            volumes.push({ name: volName, hostPath: { path: hostPath } });
+            volumeMounts.push({ name: volName, mountPath, readOnly });
+        });
+
         const body: k8s.V1Deployment = {
             metadata: { name, namespace: this.namespace, labels },
             spec: {
-                replicas: 1,
+                replicas: Math.max(1, spec.instances ?? 1),
                 selector: { matchLabels: { app: name } },
                 template: {
                     metadata: { labels },
                     spec: {
+                        volumes: volumes.length ? volumes : undefined,
                         containers: [{
                             name:  'agent',
                             image,
                             ports: [{ containerPort }],
                             env:   envVars.length ? envVars : undefined,
+                            volumeMounts: volumeMounts.length ? volumeMounts : undefined,
                             resources: (spec.memoryMb || spec.cpus) ? {
                                 limits: {
                                     ...(spec.memoryMb && { memory: `${spec.memoryMb}Mi` }),

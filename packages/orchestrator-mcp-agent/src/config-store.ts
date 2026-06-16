@@ -15,6 +15,7 @@ export interface StoredAgent {
     capability:     string;
     gate:           boolean;
     gate_criteria?: string[];
+    image?:         string;   // Docker image for containerised deployment
     instances:      { url: string; apiKey?: string }[];
 }
 
@@ -41,7 +42,7 @@ export interface StoredFlow {
 
 // ── Row shapes ────────────────────────────────────────────────────────────────
 
-interface AgentRow    { id: string; description: string|null; transport: string; strategy: string; timeout: number|null; capability: string; gate: number; gate_criteria: string|null; updatedAt: string; }
+interface AgentRow    { id: string; description: string|null; transport: string; strategy: string; timeout: number|null; capability: string; gate: number; gate_criteria: string|null; image: string|null; updatedAt: string; }
 interface InstanceRow { id: number; agent_id: string; url: string; api_key: string|null; position: number; }
 interface FlowRow     { id: string; name: string; description: string|null; trigger: string|null; updatedAt: string; }
 interface StepRow     { flow_id: string; step_id: string; agent: string; task: string; capability: string|null; input: string|null; depends_on: string; gate: number; gate_criteria: string|null; required: number; position: number; }
@@ -58,6 +59,9 @@ export class ConfigStore {
         this.db.pragma('synchronous = NORMAL');
         this.db.pragma('foreign_keys = ON');
 
+        // Migration: add image column for existing DBs
+        try { this.db.exec('ALTER TABLE agents ADD COLUMN image TEXT'); } catch {}
+
         this.db.exec(`
             CREATE TABLE IF NOT EXISTS agents (
                 id            TEXT PRIMARY KEY,
@@ -68,6 +72,7 @@ export class ConfigStore {
                 capability    TEXT NOT NULL DEFAULT 'execute',
                 gate          INTEGER NOT NULL DEFAULT 0,
                 gate_criteria TEXT,
+                image         TEXT,
                 updatedAt     TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS agent_instances (
@@ -107,16 +112,17 @@ export class ConfigStore {
         const now = new Date().toISOString();
         this.db.transaction(() => {
             this.db.prepare(`
-                INSERT INTO agents (id, description, transport, strategy, timeout, capability, gate, gate_criteria, updatedAt)
-                VALUES (@id, @description, @transport, @strategy, @timeout, @capability, @gate, @gate_criteria, @updatedAt)
+                INSERT INTO agents (id, description, transport, strategy, timeout, capability, gate, gate_criteria, image, updatedAt)
+                VALUES (@id, @description, @transport, @strategy, @timeout, @capability, @gate, @gate_criteria, @image, @updatedAt)
                 ON CONFLICT(id) DO UPDATE SET
                     description=excluded.description, transport=excluded.transport, strategy=excluded.strategy,
                     timeout=excluded.timeout, capability=excluded.capability, gate=excluded.gate,
-                    gate_criteria=excluded.gate_criteria, updatedAt=excluded.updatedAt
+                    gate_criteria=excluded.gate_criteria, image=excluded.image, updatedAt=excluded.updatedAt
             `).run({
                 id: a.id, description: a.description ?? null, transport: a.transport, strategy: a.strategy,
                 timeout: a.timeout ?? null, capability: a.capability, gate: a.gate ? 1 : 0,
-                gate_criteria: a.gate_criteria ? JSON.stringify(a.gate_criteria) : null, updatedAt: now,
+                gate_criteria: a.gate_criteria ? JSON.stringify(a.gate_criteria) : null,
+                image: a.image ?? null, updatedAt: now,
             });
             this.db.prepare('DELETE FROM agent_instances WHERE agent_id = ?').run(a.id);
             a.instances.forEach((inst, i) => {
@@ -147,6 +153,7 @@ export class ConfigStore {
             strategy: row.strategy, timeout: row.timeout ?? undefined, capability: row.capability,
             gate: row.gate === 1,
             gate_criteria: row.gate_criteria ? JSON.parse(row.gate_criteria) as string[] : undefined,
+            image: row.image ?? undefined,
             instances,
         };
     }
