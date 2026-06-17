@@ -1,5 +1,5 @@
 import { ObsidianRAGProvider } from '@backendkit-labs/agent-enterprise';
-import { TransformersEmbedder } from './transformers-embedder.js';
+import { TransformersEmbedder, type EmbedderProgress } from './transformers-embedder.js';
 import * as path from 'node:path';
 import * as os from 'node:os';
 
@@ -18,20 +18,26 @@ export interface RagSearchOptions {
 
 export class CuratorRagProvider {
     private rag: ObsidianRAGProvider;
+    private embedder: TransformersEmbedder;
     private vaultPath: string;
     private isIndexed: boolean = false;
 
     constructor(vaultPath: string) {
         this.vaultPath = vaultPath;
+        this.embedder = new TransformersEmbedder(
+            process.env.CODEX_EMBED_MODEL ?? 'Xenova/nomic-embed-text-v1'
+        );
         this.rag = new ObsidianRAGProvider({
             vaultPath,
             indexPath: this.getIndexPath(),
-            embedder: new TransformersEmbedder(
-                process.env.CODEX_EMBED_MODEL ?? 'Xenova/nomic-embed-text-v1'
-            ),
+            embedder: this.embedder,
             topK: 5,
             minScore: 0.1,
         });
+    }
+
+    async initEmbedder(onProgress?: (info: EmbedderProgress) => void): Promise<{ alreadyCached: boolean }> {
+        return this.embedder.init(onProgress);
     }
 
     private getIndexPath(): string {

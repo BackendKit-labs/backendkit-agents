@@ -36,7 +36,6 @@ import { z }                             from 'zod';
 
 import { CodeAnalyzer }   from './analyzer.js';
 import { KnowledgeEngine } from './knowledge/engine.js';
-import { TransformersEmbedder } from './knowledge/transformers-embedder.js';
 import { createProvider, type ProviderName } from './providers/index.js';
 import { findAllFiles }   from './checksum.js';
 import { resolveProject, findNote } from './project.js';
@@ -385,17 +384,14 @@ function createMcpServer(ctx: ProjectContext, engine: KnowledgeEngine, curation:
         async () => {
             const start = Date.now();
             const modelId = process.env.CODEX_EMBED_MODEL ?? 'Xenova/nomic-embed-text-v1';
-            const embedder = new TransformersEmbedder(modelId);
 
-            const files: Record<string, number> = {};
             let downloaded = false;
 
-            const { alreadyCached } = await embedder.init((info) => {
+            const { alreadyCached } = await engine.initEmbedder((info) => {
                 if (info.status === 'initiate') {
                     log(`  ↓ ${info.file}`);
                 } else if (info.status === 'downloading' && info.file && typeof info.progress === 'number') {
                     const pct = Math.round(info.progress);
-                    files[info.file] = pct;
                     const bar = '█'.repeat(Math.floor(pct / 5)) + '░'.repeat(20 - Math.floor(pct / 5));
                     log(`  [${bar}] ${pct}% — ${info.file}`);
                     downloaded = true;

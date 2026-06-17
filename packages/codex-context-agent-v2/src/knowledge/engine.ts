@@ -1,6 +1,7 @@
 import { CuratorRagProvider, type RagSearchResult } from './rag-provider.js';
 import { KnowledgeSynthesizer } from './synthesis.js';
 import type { CuratorLLMProvider } from '../providers/types.js';
+import type { EmbedderProgress } from './transformers-embedder.js';
 
 export interface SearchResponse {
     query: string;
@@ -76,6 +77,10 @@ export class KnowledgeEngine {
         const result = await this.rag.reload();
         this.isInitialized = true;
         return { indexed: result.indexed, updated: result.updated, durationMs: Date.now() - start };
+    }
+
+    async initEmbedder(onProgress?: (info: EmbedderProgress) => void): Promise<{ alreadyCached: boolean }> {
+        return this.rag.initEmbedder(onProgress);
     }
 
     async getStats(): Promise<{ initialized: boolean; vaultStats: any }> {
