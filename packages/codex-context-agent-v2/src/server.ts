@@ -37,7 +37,7 @@ import { z }                             from 'zod';
 import { CodeAnalyzer }   from './analyzer.js';
 import { KnowledgeEngine } from './knowledge/engine.js';
 import { createProvider, type ProviderName } from './providers/index.js';
-import { findAllFiles }   from './checksum.js';
+import { findAllFiles, loadManifest, saveManifest, hasFileChanged, updateManifestEntry, createManifest } from './checksum.js';
 import { resolveProject, findNote } from './project.js';
 import type { ProjectContext } from './project.js';
 
@@ -97,8 +97,26 @@ function createMcpServer(ctx: ProjectContext, engine: KnowledgeEngine, curation:
                 const analyzer = new CodeAnalyzer({ provider: makeProvider(), vaultPath: ctx.vaultPath });
 
                 if (stat.isFile()) {
+                    const dir = path.dirname(targetPath);
+                    const rel = path.basename(targetPath);
+                    const manifest = (await loadManifest(dir)) ?? createManifest(dir, ctx.vaultPath);
+
+                    // SHA256 manifest: skip unchanged files (no LLM call, no duplicates)
+                    if (!(await hasFileChanged(targetPath, rel, manifest))) {
+                        return { content: [{ type: 'text' as const, text: JSON.stringify({
+                            status: 'skipped',
+                            message: 'File unchanged since last curation (SHA256 match)',
+                            file: rel,
+                        }) }] };
+                    }
+
                     curation.activeJobs++;
                     const result = await analyzer.analyzeFile(targetPath, targetPath);
+                    const transient = result.errors?.some(e => /LLM call failed|Cannot read file|Cannot extract PDF/i.test(e));
+                    if (!transient) {
+                        await updateManifestEntry(manifest, targetPath, rel, 'success');
+                        await saveManifest(dir, manifest);
+                    }
                     engine.reload()
                         .then(() => log('✓ Vault reindexed after single-file curation'))
                         .catch(err => log(`⚠ Auto-reindex failed: ${(err as Error).message}`))
@@ -117,24 +135,59 @@ function createMcpServer(ctx: ProjectContext, engine: KnowledgeEngine, curation:
                     };
                 }
 
-                const codeCount = files.filter(f => /\.(ts|tsx|js|jsx|py|go|rs|java|c|cpp|kt|swift)$/.test(f.relativePath)).length;
-                const docCount  = files.filter(f => /\.(md|txt)$/.test(f.relativePath)).length;
+                // SHA256 manifest: only (re)curate files whose content changed since last run.
+                const manifest = (await loadManifest(targetPath)) ?? createManifest(targetPath, ctx.vaultPath);
+                const changed: typeof files = [];
+                for (const file of files) {
+                    if (await hasFileChanged(file.fullPath, file.relativePath, manifest)) {
+                        changed.push(file);
+                    }
+                }
+
+                if (changed.length === 0) {
+                    return {
+                        content: [{
+                            type: 'text' as const,
+                            text: JSON.stringify({
+                                status: 'completed',
+                                message: 'All files unchanged since last curation (SHA256 match) — nothing to do',
+                                totalFiles: files.length,
+                                changedFiles: 0,
+                                skippedFiles: files.length,
+                            }),
+                        }]
+                    };
+                }
+
+                const codeCount = changed.filter(f => /\.(ts|tsx|js|jsx|py|go|rs|java|c|cpp|kt|swift)$/.test(f.relativePath)).length;
+                const docCount  = changed.filter(f => /\.(md|txt)$/.test(f.relativePath)).length;
 
                 // Process in background without blocking, then auto-reindex
                 curation.activeJobs++;
                 (async () => {
                     try {
                         const batchSize = 10;
-                        for (let i = 0; i < files.length; i += batchSize) {
-                            const batch = files.slice(i, i + batchSize);
+                        for (let i = 0; i < changed.length; i += batchSize) {
+                            const batch = changed.slice(i, i + batchSize);
                             await Promise.all(
-                                batch.map(file =>
-                                    analyzer.analyzeFile(file.fullPath, file.relativePath, files)
-                                        .catch(err => log(`✗ ${file.relativePath}: ${(err as Error).message}`))
-                                )
+                                batch.map(async file => {
+                                    try {
+                                        const res = await analyzer.analyzeFile(file.fullPath, file.relativePath, files);
+                                        const transient = res.errors?.some(e => /LLM call failed|Cannot read file|Cannot extract PDF/i.test(e));
+                                        if (!transient) {
+                                            await updateManifestEntry(manifest, file.fullPath, file.relativePath, 'success');
+                                        } else {
+                                            log(`✗ ${file.relativePath}: ${res.errors.join('; ')}`);
+                                        }
+                                    } catch (err) {
+                                        log(`✗ ${file.relativePath}: ${(err as Error).message}`);
+                                    }
+                                })
                             );
+                            // Persist manifest progress per batch so a crash/restart resumes correctly.
+                            await saveManifest(targetPath, manifest);
                         }
-                        log(`✓ Curated ${files.length} files from ${targetPath}`);
+                        log(`✓ Curated ${changed.length} changed files from ${targetPath} (${files.length - changed.length} unchanged)`);
                         await engine.reload();
                         log('✓ Vault reindexed automatically');
                     } catch (err) {
@@ -150,8 +203,10 @@ function createMcpServer(ctx: ProjectContext, engine: KnowledgeEngine, curation:
                         type: 'text' as const,
                         text: JSON.stringify({
                             status: 'processing',
-                            message: `Started curation of ${files.length} files in background`,
+                            message: `Started curation of ${changed.length} changed files in background (${files.length - changed.length} unchanged, skipped)`,
                             totalFiles: files.length,
+                            changedFiles: changed.length,
+                            skippedFiles: files.length - changed.length,
                             codeFiles: codeCount,
                             docFiles: docCount,
                             vault: ctx.vaultPath,

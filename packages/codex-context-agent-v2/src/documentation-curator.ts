@@ -4,6 +4,7 @@ import { z } from 'zod';
 import type { CuratorLLMProvider } from './providers/types.js';
 import type { CodeAnalysisResult } from './types.js';
 import { extractPdfText } from './pdf-reader.js';
+import { removeNotesForSource, normalizeSourcePath } from './vault-dedup.js';
 
 interface DocumentationNote {
     type: 'politica' | 'decision' | 'procedimiento' | 'leccion' | 'norma_externa';
@@ -83,7 +84,7 @@ function slugify(title: string): string {
         .slice(0, 60);
 }
 
-function buildFrontmatter(note: DocumentationNote, source: string, date: string): string {
+function buildFrontmatter(note: DocumentationNote, source: string, date: string, sourcePath?: string): string {
     const tagsLine = `[${note.tags.map(t => `"${t}"`).join(', ')}]`;
     const lines = [
         '---',
@@ -94,8 +95,9 @@ function buildFrontmatter(note: DocumentationNote, source: string, date: string)
         `author: "agent/codex"`,
         `date: ${date}`,
         `source_ref: "${source}"`,
-        `tags: ${tagsLine}`,
     ];
+    if (sourcePath) lines.push(`source_path: "${normalizeSourcePath(sourcePath)}"`);
+    lines.push(`tags: ${tagsLine}`);
     if (note.vigente_desde) lines.push(`vigente_desde: ${note.vigente_desde}`);
     if (note.version) lines.push(`version: ${note.version}`);
     if (note.expires_at) lines.push(`expires_at: ${note.expires_at}`);
@@ -126,7 +128,7 @@ export class DocumentationCurator {
         this.maxInputChars = opts.maxInputChars ?? 12_000;
     }
 
-    async curateText(text: string, source: string, areaHint?: string): Promise<CodeAnalysisResult> {
+    async curateText(text: string, source: string, areaHint?: string, sourcePath?: string): Promise<CodeAnalysisResult> {
         const start = Date.now();
         const result: CodeAnalysisResult = {
             notesWritten: [],
@@ -152,9 +154,12 @@ export class DocumentationCurator {
 
         const date = new Date().toISOString().slice(0, 10);
 
+        // Borra notas previas del mismo archivo de origen para no acumular duplicados.
+        if (sourcePath) await removeNotesForSource(this.vaultPath, sourcePath);
+
         for (const note of parsed.notes) {
             try {
-                const written = await this.writeNote(note, source, date);
+                const written = await this.writeNote(note, source, date, sourcePath);
                 if (written === null) {
                     result.notesSkipped.push(note.title);
                 } else {
@@ -176,7 +181,7 @@ export class DocumentationCurator {
             try {
                 const { text, pages, filename } = await extractPdfText(filePath);
                 const source = `${filename} (${pages} pages)`;
-                return await this.curateText(text, source, areaHint);
+                return await this.curateText(text, source, areaHint, filePath);
             } catch (err) {
                 return {
                     notesWritten: [],
@@ -198,7 +203,7 @@ export class DocumentationCurator {
                 durationMs: 0,
             };
         }
-        return await this.curateText(text, path.basename(filePath), areaHint);
+        return await this.curateText(text, path.basename(filePath), areaHint, filePath);
     }
 
     private async callLLM(text: string, source: string, areaHint?: string): Promise<DocumentationResponse> {
@@ -225,7 +230,7 @@ export class DocumentationCurator {
         return DocumentationResponseSchema.parse(parsed);
     }
 
-    private async writeNote(note: DocumentationNote, source: string, date: string): Promise<string | null> {
+    private async writeNote(note: DocumentationNote, source: string, date: string, sourcePath?: string): Promise<string | null> {
         const dir = path.join(this.vaultPath, note.area);
         const slug = slugify(note.title);
         const filename = `${date}-${slug}.md`;
@@ -239,7 +244,7 @@ export class DocumentationCurator {
         }
 
         await fs.mkdir(dir, { recursive: true });
-        await fs.writeFile(filePath, buildFrontmatter(note, source, date), 'utf-8');
+        await fs.writeFile(filePath, buildFrontmatter(note, source, date, sourcePath), 'utf-8');
         return filePath;
     }
 }

@@ -4,6 +4,7 @@ import { z } from 'zod';
 import type { CuratorLLMProvider } from './providers/types.js';
 import type { CodeAnalysisNote, CodeAnalysisResult, FileAnalysisContext, AssociatedDocs } from './types.js';
 import { DocumentationCurator } from './documentation-curator.js';
+import { removeNotesForSource, normalizeSourcePath } from './vault-dedup.js';
 
 const CodeAnalysisNoteSchema = z.object({
     type: z.enum(['componente', 'api', 'patron', 'utilidad', 'arquitectura', 'integracion']),
@@ -91,7 +92,7 @@ function slugify(title: string): string {
         .slice(0, 60);
 }
 
-function buildFrontmatter(note: CodeAnalysisNote, source: string, date: string, sourcesCombined?: string[]): string {
+function buildFrontmatter(note: CodeAnalysisNote, source: string, date: string, sourcePath: string, sourcesCombined?: string[]): string {
     const tagsLine = `[${note.tags.map(t => `"${t}"`).join(', ')}]`;
     const lines = [
         '---',
@@ -103,6 +104,7 @@ function buildFrontmatter(note: CodeAnalysisNote, source: string, date: string, 
         `author: "agent/codex"`,
         `date: ${date}`,
         `source_ref: "${source}"`,
+        `source_path: "${normalizeSourcePath(sourcePath)}"`,
         `tags: ${tagsLine}`,
     ];
 
@@ -248,9 +250,13 @@ export class CodeAnalyzer {
         const date = new Date().toISOString().slice(0, 10);
         const sourcesCombined = allFiles ? this.getSourcesCombined(filePath, allFiles) : [relativePath];
 
+        // Borra las notas previas generadas desde este mismo archivo para no acumular
+        // duplicados cuando el LLM produce un título distinto en cada corrida.
+        await removeNotesForSource(this.vaultPath, filePath);
+
         for (const note of parsed.notes) {
             try {
-                const written = await this.writeNote(note, path.basename(filePath), date, sourcesCombined);
+                const written = await this.writeNote(note, path.basename(filePath), date, filePath, sourcesCombined);
                 if (written === null) {
                     result.notesSkipped.push(note.title);
                 } else {
@@ -319,6 +325,7 @@ export class CodeAnalyzer {
         note: CodeAnalysisNote,
         source: string,
         date: string,
+        sourcePath: string,
         sourcesCombined?: string[]
     ): Promise<string | null> {
         const dir = path.join(this.vaultPath, note.area);
@@ -334,7 +341,7 @@ export class CodeAnalyzer {
         }
 
         await fs.mkdir(dir, { recursive: true });
-        const content = buildFrontmatter(note, source, date, sourcesCombined);
+        const content = buildFrontmatter(note, source, date, sourcePath, sourcesCombined);
         await fs.writeFile(filePath, content, 'utf-8');
         return filePath;
     }
