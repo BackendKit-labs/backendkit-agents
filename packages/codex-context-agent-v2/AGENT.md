@@ -322,59 +322,137 @@ Retorna:
 
 ---
 
+### `clone_vault`
+
+Copia notas desde un vault existente al vault del proyecto activo. Preserva la estructura de directorios y mergea sin pisar lo que ya existe (por defecto). Reindexea automáticamente al terminar.
+
+```
+Parámetros:
+  sourcePath (string, requerido) — ruta absoluta al vault origen (soporta ~ expansion)
+  overwrite  (boolean, opcional) — reemplazar notas que ya existen (default: false)
+
+Retorna:
+  - status: "cloned"
+  - sourcePath: ruta del vault origen expandida
+  - targetVault: ruta del vault destino
+  - copied: cantidad de notas copiadas
+  - skipped: cantidad de notas salteadas (ya existían)
+  - totalNotes: copied + skipped
+  - reindexing: true (reindexado disparado en background)
+```
+
+**Ejemplos:**
+
+```
+Seed inicial desde un vault de conocimiento compartido
+→ clone_vault("~/.codex-vaults/ia-knowledge")
+
+Clonar y pisar notas existentes
+→ clone_vault("~/.codex-vaults/ia-knowledge", overwrite=true)
+```
+
+---
+
+### `init_embedder`
+
+Descarga e inicializa el modelo de embeddings local (`nomic-embed-text-v1`, ~274MB). Ejecutar una vez al configurar el agente en una máquina nueva para pre-cachear el modelo antes del primer uso. Si el modelo ya está en cache, retorna de inmediato.
+
+```
+Parámetros:
+  (ninguno)
+
+Retorna:
+  - status: "already_cached" | "downloaded" | "loaded_from_cache"
+  - model: ID del modelo usado
+  - cacheDir: ruta donde quedó cacheado (~/.cache/codex-context/models)
+  - durationMs: tiempo transcurrido
+
+Progreso de descarga:
+  Visible en los logs del servidor MCP (stderr)
+  [████████████░░░░░░░░] 62% — model.onnx
+```
+
+**Cuándo usarlo:** normalmente no hace falta — la descarga ocurre automáticamente en el primer `search_vault` o reindexado. Usá `init_embedder` si querés pre-cachear el modelo en background antes de la primera sesión, o para verificar que el modelo está disponible.
+
+---
+
+### `reindex_vault`
+
+Reconstruye el índice de búsqueda semántica del vault actual y espera a que esté completo antes de retornar. A diferencia del reindexado automático que ocurre en background después de `curate_path`, esta tool bloquea hasta terminar.
+
+```
+Parámetros:
+  (ninguno)
+
+Retorna:
+  - status: "indexed"
+  - indexed: cantidad de notas indexadas
+  - updated: cantidad de notas actualizadas en el índice
+  - durationMs: tiempo de reindexado
+```
+
+**Cuándo usarlo:** después de `clone_vault` si querés esperar a que el índice esté listo antes de buscar, o cuando `vault_status` muestra `indexed: false`.
+
+---
+
 ## Flujo típico de uso
 
 ```
-1. Setup inicial (una vez)
+1. Setup inicial (una vez por máquina)
    → npm install && npm run build
    → configurar settings.json y settings.local.json
-   → (sin Ollama ni setup adicional)
+   → (opcional) init_embedder() — pre-cachear nomic-embed-text-v1 (~274MB)
 
 2. Abrir el proyecto en Claude Code
    → el agente detecta el git root automáticamente
    → el índice RAG se carga en background (no bloquea el arranque)
-   → primera vez: descarga nomic-embed-text-v1 (~274MB)
+   → si el modelo no está cacheado, se descarga en el primer reindexado
 
-3. Primera vez — curar el código base
+3. (Opcional) Seed desde un vault existente
+   → clone_vault("~/.codex-vaults/otro-proyecto")
+   → copia notas y reindexea automáticamente
+
+4. Primera vez — curar el código base
    → curate_path("/ruta/al/proyecto/src")
    → procesa en background + reindexea automáticamente al terminar
 
-4. Consultar durante el desarrollo
+5. Consultar durante el desarrollo
    → search_vault("¿cómo se valida un token JWT?")
    → read_note("AuthService JWT") para leer la nota completa
 
-5. Curar archivos nuevos o modificados
+6. Curar archivos nuevos o modificados
    → curate_path("/ruta/al/archivo-nuevo.ts")
    → el reindexado ocurre automáticamente
+
+7. Forzar reindexado completo (si es necesario)
+   → reindex_vault() — espera hasta que el índice esté listo
 ```
 
 ---
 
 ## Configuración global (todos los proyectos)
 
-Si querés que el agente esté disponible en cualquier proyecto sin configurar cada uno:
+Si querés que el agente esté disponible en cualquier proyecto sin configurar cada uno, usá el CLI de Claude Code con `--scope user`. Esto registra el servidor en `~/.claude.json` globalmente:
 
-```
-~/.claude/settings.json   (Linux/Mac)
-%APPDATA%\Claude\settings.json   (Windows)
-```
-
-```json
-{
-  "mcpServers": {
-    "codex-context": {
-      "command": "node",
-      "args": ["/ruta/a/codex-context-agent-v2/dist/server.js"],
-      "env": {
-        "CODEX_API_KEY": "sk-tu-key",
-        "CODEX_PROVIDER": "deepseek"
-      }
-    }
-  }
-}
+```bash
+claude mcp add --scope user codex-context node \
+  "/ruta/absoluta/a/codex-context-agent-v2/dist/server.js" \
+  -e CODEX_PROVIDER=deepseek \
+  -e CODEX_API_KEY=sk-tu-key
 ```
 
-En este caso el vault se detecta automáticamente por git root cada vez que iniciás Claude Code en un proyecto distinto.
+**Windows:**
+
+```powershell
+claude mcp add --scope user codex-context node `
+  "C:\ruta\a\codex-context-agent-v2\dist\server.js" `
+  -e CODEX_PROVIDER=deepseek `
+  -e CODEX_API_KEY=sk-tu-key
+```
+
+El vault se detecta automáticamente por git root en cada proyecto donde abras Claude Code.
+
+> **Nota:** editar `~/.claude/settings.json` directamente con `mcpServers` no funciona para registrar servidores globalmente — Claude Code los lee desde `~/.claude.json`. El comando `claude mcp add --scope user` escribe en el lugar correcto.
 
 ---
 

@@ -14,6 +14,14 @@ async function getPipeline() {
     return pipelineFn;
 }
 
+export interface EmbedderProgress {
+    status: 'initiate' | 'downloading' | 'done' | 'ready' | string;
+    file?: string;
+    progress?: number;
+    loaded?: number;
+    total?: number;
+}
+
 export class TransformersEmbedder {
     readonly model: string;
     private extractor: any = null;
@@ -22,12 +30,20 @@ export class TransformersEmbedder {
         this.model = modelId;
     }
 
-    private async getExtractor() {
+    private async getExtractor(onProgress?: (info: EmbedderProgress) => void) {
         if (!this.extractor) {
             const pipeline = await getPipeline();
-            this.extractor = await pipeline('feature-extraction', this.model);
+            this.extractor = await pipeline('feature-extraction', this.model, {
+                progress_callback: onProgress,
+            });
         }
         return this.extractor;
+    }
+
+    async init(onProgress?: (info: EmbedderProgress) => void): Promise<{ alreadyCached: boolean }> {
+        const alreadyCached = this.extractor !== null;
+        await this.getExtractor(onProgress);
+        return { alreadyCached };
     }
 
     async embed(texts: string[]): Promise<number[][]> {

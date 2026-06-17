@@ -36,6 +36,7 @@ import { z }                             from 'zod';
 
 import { CodeAnalyzer }   from './analyzer.js';
 import { KnowledgeEngine } from './knowledge/engine.js';
+import { TransformersEmbedder } from './knowledge/transformers-embedder.js';
 import { createProvider, type ProviderName } from './providers/index.js';
 import { findAllFiles }   from './checksum.js';
 import { resolveProject, findNote } from './project.js';
@@ -367,6 +368,98 @@ function createMcpServer(ctx: ProjectContext, engine: KnowledgeEngine, curation:
                         text: JSON.stringify({ error: (err as Error).message }),
                     }]
                 };
+            }
+        },
+    );
+
+    // ── init_embedder ────────────────────────────────────────────────────────
+
+    t(
+        'init_embedder',
+        'Download and initialize the local embedding model (nomic-embed-text-v1, ~274MB). ' +
+        'Run this once after setting up the agent in a new machine or project — it pre-caches the model ' +
+        'so the first search_vault or reindex_vault does not block. ' +
+        'Shows download progress in the server logs. ' +
+        'If the model is already cached, returns immediately.',
+        {},
+        async () => {
+            const start = Date.now();
+            const modelId = process.env.CODEX_EMBED_MODEL ?? 'Xenova/nomic-embed-text-v1';
+            const embedder = new TransformersEmbedder(modelId);
+
+            const files: Record<string, number> = {};
+            let downloaded = false;
+
+            const { alreadyCached } = await embedder.init((info) => {
+                if (info.status === 'initiate') {
+                    log(`  ↓ ${info.file}`);
+                } else if (info.status === 'downloading' && info.file && typeof info.progress === 'number') {
+                    const pct = Math.round(info.progress);
+                    files[info.file] = pct;
+                    const bar = '█'.repeat(Math.floor(pct / 5)) + '░'.repeat(20 - Math.floor(pct / 5));
+                    log(`  [${bar}] ${pct}% — ${info.file}`);
+                    downloaded = true;
+                } else if (info.status === 'done' && info.file) {
+                    log(`  ✓ ${info.file}`);
+                }
+            });
+
+            const durationMs = Date.now() - start;
+            const status = alreadyCached ? 'already_cached' : downloaded ? 'downloaded' : 'loaded_from_cache';
+
+            log(`✓ Embedder ready (${status}, ${durationMs}ms)`);
+
+            return {
+                content: [{
+                    type: 'text' as const,
+                    text: JSON.stringify({
+                        status,
+                        model: modelId,
+                        cacheDir: `${os.homedir()}/.cache/codex-context/models`,
+                        durationMs,
+                    }),
+                }]
+            };
+        },
+    );
+
+    // ── reindex_vault ─────────────────────────────────────────────────────────
+
+    t(
+        'reindex_vault',
+        'Rebuild the semantic search index for the current project vault. ' +
+        'Waits until the index is complete before returning. ' +
+        'Use this after clone_vault or when vault_status shows indexed: false. ' +
+        'For automatic reindexing after curate_path, this is not needed — it happens in background.',
+        {},
+        async () => {
+            const start = Date.now();
+            log('Reindexing vault...');
+            curation.activeJobs++;
+            try {
+                const result = await engine.reload();
+                curation.lastCompletedAt = new Date();
+                log(`✓ Vault reindexed: ${result.indexed} notes`);
+                return {
+                    content: [{
+                        type: 'text' as const,
+                        text: JSON.stringify({
+                            status: 'indexed',
+                            indexed: result.indexed,
+                            updated: result.updated,
+                            durationMs: Date.now() - start,
+                        }),
+                    }]
+                };
+            } catch (err) {
+                return {
+                    content: [{
+                        type: 'text' as const,
+                        text: JSON.stringify({ error: (err as Error).message }),
+                    }]
+                };
+            } finally {
+                curation.activeJobs--;
             }
         },
     );
