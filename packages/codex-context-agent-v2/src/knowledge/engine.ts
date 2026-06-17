@@ -25,15 +25,24 @@ export class KnowledgeEngine {
     private rag: CuratorRagProvider;
     private synthesizer: KnowledgeSynthesizer;
     private isInitialized: boolean = false;
+    private indexQueue: Promise<any> = Promise.resolve();
 
     constructor(provider: CuratorLLMProvider, vaultPath: string) {
         this.rag = new CuratorRagProvider(vaultPath);
         this.synthesizer = new KnowledgeSynthesizer(provider, vaultPath);
     }
 
+    private serialized<T>(fn: () => Promise<T>): Promise<T> {
+        const next = this.indexQueue.then(() => fn(), () => fn());
+        this.indexQueue = next.then(() => {}, () => {});
+        return next;
+    }
+
     async initialize(): Promise<void> {
-        await this.rag.indexVault();
-        this.isInitialized = true;
+        return this.serialized(async () => {
+            await this.rag.indexVault();
+            this.isInitialized = true;
+        });
     }
 
     async search(
@@ -73,10 +82,12 @@ export class KnowledgeEngine {
     }
 
     async reload(): Promise<ReloadResponse> {
-        const start = Date.now();
-        const result = await this.rag.reload();
-        this.isInitialized = true;
-        return { indexed: result.indexed, updated: result.updated, durationMs: Date.now() - start };
+        return this.serialized(async () => {
+            const start = Date.now();
+            const result = await this.rag.reload();
+            this.isInitialized = true;
+            return { indexed: result.indexed, updated: (result as any).updated ?? 0, durationMs: Date.now() - start };
+        });
     }
 
     async initEmbedder(onProgress?: (info: EmbedderProgress) => void): Promise<{ alreadyCached: boolean }> {
