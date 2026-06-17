@@ -8,6 +8,7 @@
  *
  * Tools:
  *   curate_path      — analyze a file or directory and store knowledge in the vault
+ *   curate_link      — curate from a git repo URL or HTTP documentation page
  *   search_vault     — semantic search (RAG) across the project vault
  *   read_note        — read a curated note by title or path
  *   vault_status     — show vault location, project info, and index stats
@@ -25,18 +26,21 @@
  */
 
 import 'dotenv/config';
-import * as http from 'node:http';
-import * as fs   from 'node:fs/promises';
-import * as path from 'node:path';
-import * as os   from 'node:os';
+import * as http   from 'node:http';
+import * as fs     from 'node:fs/promises';
+import * as path   from 'node:path';
+import * as os     from 'node:os';
+import * as crypto from 'node:crypto';
+import { execSync } from 'node:child_process';
 
 import { McpServer }                     from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport }          from '@modelcontextprotocol/sdk/server/stdio.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z }                             from 'zod';
 
-import { CodeAnalyzer }   from './analyzer.js';
-import { KnowledgeEngine } from './knowledge/engine.js';
+import { CodeAnalyzer }        from './analyzer.js';
+import { DocumentationCurator } from './documentation-curator.js';
+import { KnowledgeEngine }      from './knowledge/engine.js';
 import { createProvider, type ProviderName } from './providers/index.js';
 import { findAllFiles, loadManifest, saveManifest, hasFileChanged, updateManifestEntry, createManifest } from './checksum.js';
 import { resolveProject, findNote } from './project.js';
@@ -214,6 +218,172 @@ function createMcpServer(ctx: ProjectContext, engine: KnowledgeEngine, curation:
                         }),
                     }]
                 };
+            } catch (err) {
+                return {
+                    content: [{
+                        type: 'text' as const,
+                        text: JSON.stringify({ error: (err as Error).message }),
+                    }]
+                };
+            }
+        },
+    );
+
+    // ── curate_link ──────────────────────────────────────────────────────────
+
+    t(
+        'curate_link',
+        'Curate knowledge from an external source into the project vault. ' +
+        'Supports git repository URLs (GitHub, GitLab, Bitbucket, or any git remote) ' +
+        'and HTTP/HTTPS documentation pages. ' +
+        'Git repos are cloned with --depth 1 (no full history) and processed file by file in the background. ' +
+        'HTTP/HTTPS pages are fetched, converted to markdown, and analyzed by the LLM directly (synchronous). ' +
+        'Use subPath to target a specific subdirectory of a large repository.',
+        {
+            url: z.string().describe(
+                'Git repository URL (e.g. "https://github.com/org/repo") or HTTP/HTTPS URL to a documentation page. ' +
+                'Git URLs ending in .git or from known hosts (github.com, gitlab.com, bitbucket.org, codeberg.org) are auto-detected as git.'
+            ),
+            subPath: z.string().optional().describe(
+                'Subdirectory within a git repo to curate instead of the full repo. ' +
+                'Example: "src/auth" or "packages/core". Ignored for HTTP URLs.'
+            ),
+            branch: z.string().optional().describe(
+                'Git branch, tag, or commit to clone. Defaults to the remote\'s default branch. Ignored for HTTP URLs.'
+            ),
+        },
+        async ({ url, subPath, branch }: { url: string; subPath?: string; branch?: string }) => {
+            try {
+                if (isGitUrl(url)) {
+                    // ── Git repo: clone + curate in background ────────────────
+                    const urlHash = crypto.createHash('md5')
+                        .update(url + (branch ?? '') + (subPath ?? ''))
+                        .digest('hex').slice(0, 12);
+                    const tempDir = path.join(os.tmpdir(), `codex-link-${urlHash}`);
+
+                    curation.activeJobs++;
+                    (async () => {
+                        try {
+                            await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+                            log(`↓ Cloning ${url}${branch ? `@${branch}` : ''}...`);
+
+                            execSync(
+                                `git clone --depth 1${branch ? ` --branch "${branch}"` : ''} "${url}" "${tempDir}"`,
+                                { stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000, encoding: 'utf-8' },
+                            );
+
+                            const targetPath = subPath ? path.join(tempDir, subPath) : tempDir;
+                            const stat = await fs.stat(targetPath).catch(() => null);
+                            if (!stat?.isDirectory()) {
+                                throw new Error(`subPath "${subPath}" not found in cloned repository`);
+                            }
+
+                            const files = await findAllFiles(targetPath);
+                            if (files.length === 0) {
+                                log(`⚠ No supported files found in ${targetPath}`);
+                                return;
+                            }
+
+                            log(`→ Curating ${files.length} files from ${url}...`);
+                            const analyzer = new CodeAnalyzer({ provider: makeProvider(), vaultPath: ctx.vaultPath });
+                            const batchSize = 10;
+                            for (let i = 0; i < files.length; i += batchSize) {
+                                const batch = files.slice(i, i + batchSize);
+                                await Promise.all(batch.map(async file => {
+                                    try {
+                                        await analyzer.analyzeFile(file.fullPath, file.relativePath, files);
+                                    } catch (err) {
+                                        log(`✗ ${file.relativePath}: ${(err as Error).message}`);
+                                    }
+                                }));
+                            }
+
+                            await engine.reload();
+                            log(`✓ curate_link complete: ${files.length} files from ${url}`);
+                        } catch (err) {
+                            log(`✗ curate_link failed (${url}): ${(err as Error).message}`);
+                        } finally {
+                            await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+                            curation.activeJobs--;
+                            curation.lastCompletedAt = new Date();
+                        }
+                    })();
+
+                    return {
+                        content: [{
+                            type: 'text' as const,
+                            text: JSON.stringify({
+                                status: 'processing',
+                                source: 'git',
+                                url,
+                                ...(branch   ? { branch }   : {}),
+                                ...(subPath  ? { subPath }  : {}),
+                                message: `Cloning and curating ${url} in background. Check vault_status for completion.`,
+                                vault: ctx.vaultPath,
+                            }),
+                        }]
+                    };
+
+                } else if (url.startsWith('http://') || url.startsWith('https://')) {
+                    // ── HTTP URL: fetch + convert + analyze (synchronous) ─────
+                    log(`↓ Fetching ${url}...`);
+                    const response = await fetch(url, {
+                        headers: { 'User-Agent': 'codex-context-agent/0.2 (knowledge-curator)' },
+                        signal: AbortSignal.timeout(30_000),
+                    });
+
+                    if (!response.ok) {
+                        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                    }
+
+                    const contentType = response.headers.get('content-type') ?? '';
+                    let text: string;
+
+                    if (contentType.includes('text/html')) {
+                        text = htmlToMarkdown(await response.text());
+                    } else if (contentType.includes('text/markdown') || contentType.includes('text/plain')) {
+                        text = await response.text();
+                    } else {
+                        throw new Error(
+                            `Unsupported content-type: ${contentType}. ` +
+                            'Only text/html, text/markdown, and text/plain are supported. ' +
+                            'JavaScript-rendered SPAs are not supported — use a static documentation URL.'
+                        );
+                    }
+
+                    if (text.trim().length < 100) {
+                        throw new Error(
+                            'Page content too short after extraction (< 100 chars). ' +
+                            'The page may be JavaScript-rendered — try a static documentation URL.'
+                        );
+                    }
+
+                    // Use the URL itself as source_path so dedup works across re-runs
+                    const curator = new DocumentationCurator({ provider: makeProvider(), vaultPath: ctx.vaultPath });
+                    const result = await curator.curateText(text, url, undefined, url);
+
+                    engine.reload()
+                        .then(() => log('✓ Vault reindexed after curate_link'))
+                        .catch(err => log(`⚠ Auto-reindex failed: ${(err as Error).message}`));
+
+                    log(`✓ curate_link complete: ${result.notesWritten.length} notes from ${url}`);
+                    return {
+                        content: [{
+                            type: 'text' as const,
+                            text: JSON.stringify({ ...result, source: 'http', url }),
+                        }]
+                    };
+
+                } else {
+                    return {
+                        content: [{
+                            type: 'text' as const,
+                            text: JSON.stringify({
+                                error: 'Unsupported URL scheme. Use a git URL (https://github.com/...) or an HTTP/HTTPS documentation URL.',
+                            }),
+                        }]
+                    };
+                }
             } catch (err) {
                 return {
                     content: [{
@@ -622,6 +792,49 @@ async function cloneVaultDir(
     }
 
     return { copied, skipped };
+}
+
+// ── curate_link helpers ───────────────────────────────────────────────────────
+
+function isGitUrl(url: string): boolean {
+    if (url.startsWith('git@') || url.startsWith('git://')) return true;
+    if (!url.startsWith('http://') && !url.startsWith('https://')) return false;
+    return (
+        url.endsWith('.git') ||
+        /^https?:\/\/(github\.com|gitlab\.com|bitbucket\.org|codeberg\.org)\//i.test(url)
+    );
+}
+
+function htmlToMarkdown(html: string): string {
+    return html
+        .replace(/<script[\s\S]*?<\/script>/gi, '')
+        .replace(/<style[\s\S]*?<\/style>/gi, '')
+        .replace(/<nav[\s\S]*?<\/nav>/gi, '')
+        .replace(/<footer[\s\S]*?<\/footer>/gi, '')
+        .replace(/<header[\s\S]*?<\/header>/gi, '')
+        .replace(/<h1[^>]*>([\s\S]*?)<\/h1>/gi, '\n# $1\n')
+        .replace(/<h2[^>]*>([\s\S]*?)<\/h2>/gi, '\n## $1\n')
+        .replace(/<h3[^>]*>([\s\S]*?)<\/h3>/gi, '\n### $1\n')
+        .replace(/<h4[^>]*>([\s\S]*?)<\/h4>/gi, '\n#### $1\n')
+        .replace(/<pre[^>]*><code[^>]*>([\s\S]*?)<\/code><\/pre>/gi, '\n```\n$1\n```\n')
+        .replace(/<code[^>]*>([\s\S]*?)<\/code>/gi, '`$1`')
+        .replace(/<li[^>]*>([\s\S]*?)<\/li>/gi, '\n- $1')
+        .replace(/<p[^>]*>([\s\S]*?)<\/p>/gi, '\n$1\n')
+        .replace(/<br\s*\/?>/gi, '\n')
+        .replace(/<a[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi, '[$2]($1)')
+        .replace(/<strong[^>]*>([\s\S]*?)<\/strong>/gi, '**$1**')
+        .replace(/<em[^>]*>([\s\S]*?)<\/em>/gi, '*$1*')
+        .replace(/<[^>]+>/g, '')
+        .replace(/&amp;/g, '&')
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/&nbsp;/g, ' ')
+        .replace(/&#x27;/g, "'")
+        .replace(/&#x2F;/g, '/')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
 }
 
 // ── deleteManifests helper ────────────────────────────────────────────────────

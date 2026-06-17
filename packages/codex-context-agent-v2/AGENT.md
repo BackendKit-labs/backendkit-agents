@@ -245,6 +245,52 @@ Curate documentación PDF
 
 ---
 
+### `curate_link`
+
+Cura conocimiento desde una fuente externa hacia el vault del proyecto activo. Soporta repositorios git y páginas HTTP/HTTPS de documentación.
+
+```
+Parámetros:
+  url     (string, requerido)  — URL de un repo git o página HTTP/HTTPS
+  subPath (string, opcional)   — subdirectorio del repo a curar (ej. "src/auth")
+  branch  (string, opcional)   — rama, tag o commit a clonar (default: rama por defecto)
+
+Detección automática de fuente:
+  Git:  URLs que terminan en .git, o de github.com, gitlab.com, bitbucket.org, codeberg.org
+  HTTP: cualquier https:// o http:// no detectado como git
+
+Comportamiento por tipo:
+  Git:  clona con --depth 1 a un directorio temporal, procesa archivos en background,
+        limpia el temp dir al terminar. Retorna inmediatamente con status: "processing".
+  HTTP: fetch síncrono → conversión HTML a markdown → análisis LLM → retorna resultado.
+        No soporta SPAs (JavaScript-rendered) — usá URLs de documentación estática.
+```
+
+**Ejemplos:**
+
+```
+Curar un repo de GitHub
+→ curate_link("https://github.com/nestjs/nest")
+
+Solo el directorio packages/core
+→ curate_link("https://github.com/nestjs/nest", subPath="packages/core")
+
+Una rama específica
+→ curate_link("https://github.com/org/repo", branch="develop")
+
+Página de documentación
+→ curate_link("https://docs.nestjs.com/controllers")
+
+Repo vía SSH
+→ curate_link("git@github.com:org/repo.git")
+```
+
+**Dedup entre re-ejecuciones:**
+- Git: el directorio temporal usa un hash del URL+branch+subPath, así `source_path` es estable. `removeNotesForSource` elimina notas previas antes de regenerar.
+- HTTP: el URL se usa directamente como `source_path` en el frontmatter, garantizando dedup exacto.
+
+---
+
 ### `search_vault`
 
 Búsqueda semántica (RAG) contra el vault del proyecto activo.
@@ -469,7 +515,11 @@ Luego reconstruir           → curate_path("/ruta/al/proyecto/src")
 7. Forzar reindexado completo (si es necesario)
    → reindex_vault() — espera hasta que el índice esté listo
 
-8. Resetear el vault (si está corrupto o desactualizado)
+8. Curar fuentes externas
+   → curate_link("https://github.com/org/repo", subPath="src")
+   → curate_link("https://docs.example.com/api") — página de documentación
+
+9. Resetear el vault (si está corrupto o desactualizado)
    → reset_vault() — borra todo y deja el vault vacío
    → curate_path("/ruta/al/proyecto/src") — reconstruir desde cero
 ```

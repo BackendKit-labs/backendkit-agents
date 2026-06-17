@@ -1,6 +1,6 @@
 # MCP Tools — Referencia completa
 
-El agente expone 8 herramientas MCP. Todas retornan JSON serializado en el campo `content[0].text`.
+El agente expone 9 herramientas MCP. Todas retornan JSON serializado en el campo `content[0].text`.
 
 ---
 
@@ -83,6 +83,73 @@ Analiza un archivo o directorio y extrae conocimiento al vault.
 - Archivo de código: ~3-8 segundos (deepseek-reasoner es un modelo de razonamiento lento)
 - 47 archivos: ~5-20 minutos en background
 - Llamar `vault_status({ reload: true })` después para reindexar
+
+---
+
+## `curate_link`
+
+Cura conocimiento desde una fuente externa hacia el vault del proyecto.
+
+### Parámetros
+
+| Nombre | Tipo | Requerido | Descripción |
+|---|---|---|---|
+| `url` | string | Sí | URL de un repo git o página HTTP/HTTPS |
+| `subPath` | string | No | Subdirectorio del repo a curar (ej. `"src/auth"`) |
+| `branch` | string | No | Rama, tag o commit a clonar (default: rama por defecto del repo) |
+
+### Detección de tipo de fuente
+
+| Tipo | Criterio |
+|---|---|
+| **git** | URL termina en `.git`, o host es `github.com`, `gitlab.com`, `bitbucket.org`, `codeberg.org`, o empieza con `git@` / `git://` |
+| **http** | Cualquier `https://` o `http://` no detectado como git |
+
+### Comportamiento por tipo
+
+**Git (asíncrono):**
+- Clona con `git clone --depth 1` a un directorio temporal (hash del URL+branch+subPath)
+- Procesa archivos en background con los mismos batches de 10 que `curate_path`
+- Limpia el directorio temporal al terminar
+- Retorna `{ status: "processing" }` inmediatamente
+
+**HTTP (síncrono):**
+- `fetch` con timeout de 30 segundos
+- Si `content-type` es `text/html`: convierte a markdown (elimina scripts/styles/nav/footer, convierte headings, listas, links)
+- Si `content-type` es `text/markdown` o `text/plain`: usa el texto directo
+- Analiza con el LLM y retorna el resultado completo
+
+### Respuesta — git
+
+```json
+{
+  "status": "processing",
+  "source": "git",
+  "url": "https://github.com/nestjs/nest",
+  "subPath": "packages/core",
+  "message": "Cloning and curating https://github.com/nestjs/nest in background. Check vault_status for completion.",
+  "vault": "/home/user/.codex-vaults/my-project"
+}
+```
+
+### Respuesta — http
+
+```json
+{
+  "notesWritten": ["/home/user/.codex-vaults/my-project/soporte/2026-06-17-nestjs-controllers.md"],
+  "notesSkipped": [],
+  "errors": [],
+  "durationMs": 4800,
+  "source": "http",
+  "url": "https://docs.nestjs.com/controllers"
+}
+```
+
+### Limitaciones
+
+- **SPAs / JavaScript-rendered**: si el HTML fetched tiene menos de 100 caracteres de contenido útil, retorna error. Usar URLs de documentación estática (GitHub Pages, Docusaurus, ReadTheDocs, etc.).
+- **Repos privados**: el clon usa las credenciales git configuradas en el sistema. Si tenés `git` autenticado (SSH o HTTPS), funciona.
+- **Repos grandes**: `--depth 1` omite el historial pero clona todos los archivos del working tree. Usá `subPath` para repositorios monorepo de cientos de archivos.
 
 ---
 
