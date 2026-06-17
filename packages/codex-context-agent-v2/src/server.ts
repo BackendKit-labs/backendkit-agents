@@ -11,6 +11,7 @@
  *   search_vault     — semantic search (RAG) across the project vault
  *   read_note        — read a curated note by title or path
  *   vault_status     — show vault location, project info, and index stats
+ *   reset_vault      — delete all notes, index, and manifests; start fresh
  *
  * Required env:
  *   CODEX_API_KEY    — LLM API key
@@ -515,6 +516,76 @@ function createMcpServer(ctx: ProjectContext, engine: KnowledgeEngine, curation:
         },
     );
 
+    // ── reset_vault ──────────────────────────────────────────────────────────
+
+    t(
+        'reset_vault',
+        'Delete all curated notes, the semantic search index, and all SHA256 curation manifests for the current project vault. ' +
+        'Use when the vault is corrupted, outdated, or no longer relevant to the current project version. ' +
+        'The vault directory is recreated empty and the in-memory index is reset. ' +
+        'After this, run curate_path again to rebuild the vault from scratch.',
+        {},
+        async () => {
+            try {
+                // Count notes before deletion for the report
+                let noteCount = 0;
+                try {
+                    const entries = await fs.readdir(ctx.vaultPath, { withFileTypes: true });
+                    for (const entry of entries) {
+                        if (entry.isDirectory()) {
+                            const subEntries = await fs.readdir(path.join(ctx.vaultPath, entry.name)).catch(() => [] as string[]);
+                            noteCount += subEntries.filter(f => f.endsWith('.md')).length;
+                        } else if (entry.isFile() && entry.name.endsWith('.md')) {
+                            noteCount++;
+                        }
+                    }
+                } catch { /* ignore */ }
+
+                // 1. Delete vault contents and recreate empty
+                await fs.rm(ctx.vaultPath, { recursive: true, force: true });
+                await fs.mkdir(ctx.vaultPath, { recursive: true });
+
+                // 2. Delete RAG index
+                const indexPath = path.join(os.homedir(), '.codex-context', 'rag', `${ctx.projectName}.json`);
+                let indexDeleted = false;
+                try {
+                    await fs.rm(indexPath, { force: true });
+                    indexDeleted = true;
+                } catch { /* ignore */ }
+
+                // 3. Delete all SHA256 manifests under the project root
+                const manifestsDeleted = await deleteManifests(ctx.projectRoot);
+
+                // 4. Reset in-memory engine state by reindexing the now-empty vault
+                await engine.reload();
+                curation.lastCompletedAt = undefined;
+
+                log(`✓ Vault reset: deleted ${noteCount} notes, ${manifestsDeleted} manifests`);
+
+                return {
+                    content: [{
+                        type: 'text' as const,
+                        text: JSON.stringify({
+                            status: 'reset',
+                            vaultPath: ctx.vaultPath,
+                            notesDeleted: noteCount,
+                            indexDeleted,
+                            manifestsDeleted,
+                            message: `Vault reset. Run curate_path("${ctx.projectRoot}") to rebuild from scratch.`,
+                        }),
+                    }]
+                };
+            } catch (err) {
+                return {
+                    content: [{
+                        type: 'text' as const,
+                        text: JSON.stringify({ error: (err as Error).message }),
+                    }]
+                };
+            }
+        },
+    );
+
     return srv;
 }
 
@@ -551,6 +622,30 @@ async function cloneVaultDir(
     }
 
     return { copied, skipped };
+}
+
+// ── deleteManifests helper ────────────────────────────────────────────────────
+
+async function deleteManifests(dir: string): Promise<number> {
+    let count = 0;
+    let entries: Awaited<ReturnType<typeof fs.readdir>>;
+    try {
+        entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch {
+        return count;
+    }
+    for (const entry of entries) {
+        if (entry.name === 'node_modules' || entry.name === '.git' ||
+            entry.name === 'dist' || entry.name === 'build' || entry.name.startsWith('.')) continue;
+        const fullPath = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+            count += await deleteManifests(fullPath);
+        } else if (entry.isFile() && entry.name === '.codex-manifest.json') {
+            await fs.rm(fullPath, { force: true });
+            count++;
+        }
+    }
+    return count;
 }
 
 // ── Transports ────────────────────────────────────────────────────────────────

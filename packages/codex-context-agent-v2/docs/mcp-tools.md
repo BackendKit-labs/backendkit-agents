@@ -1,6 +1,6 @@
 # MCP Tools — Referencia completa
 
-El agente expone 4 herramientas MCP. Todas retornan JSON serializado en el campo `content[0].text`.
+El agente expone 8 herramientas MCP. Todas retornan JSON serializado en el campo `content[0].text`.
 
 ---
 
@@ -245,3 +245,114 @@ Flujo típico:
 ### noteCount
 
 Cuenta todos los `.md` en el vault recursivamente, incluyendo notas de síntesis en `vault/synthesis/`.
+
+---
+
+## `clone_vault`
+
+Copia notas desde un vault existente al vault del proyecto activo. Preserva la estructura de directorios y mergea sin pisar lo que ya existe (por defecto). Reindexea automáticamente al terminar.
+
+### Parámetros
+
+| Nombre | Tipo | Default | Descripción |
+|---|---|---|---|
+| `sourcePath` | string | — | Ruta absoluta al vault origen (soporta `~` expansion) |
+| `overwrite` | boolean | false | Reemplazar notas que ya existen en el target |
+
+### Respuesta
+
+```json
+{
+  "status": "cloned",
+  "sourcePath": "/home/user/.codex-vaults/ia-knowledge",
+  "targetVault": "/home/user/.codex-vaults/my-project",
+  "copied": 34,
+  "skipped": 5,
+  "totalNotes": 39,
+  "reindexing": true
+}
+```
+
+---
+
+## `init_embedder`
+
+Descarga e inicializa el modelo de embeddings local (`nomic-embed-text-v1`, ~274MB). Si el modelo ya está en cache, retorna de inmediato. El progreso de descarga se imprime en los logs del servidor (stderr).
+
+### Parámetros
+
+(ninguno)
+
+### Respuesta
+
+```json
+{
+  "status": "already_cached",
+  "model": "Xenova/nomic-embed-text-v1",
+  "cacheDir": "/home/user/.cache/codex-context/models",
+  "durationMs": 120
+}
+```
+
+`status` puede ser `"already_cached"`, `"downloaded"`, o `"loaded_from_cache"`.
+
+---
+
+## `reindex_vault`
+
+Reconstruye el índice semántico del vault y bloquea hasta que esté completo. A diferencia del reindexado automático de `curate_path` (que ocurre en background), este espera el resultado.
+
+### Parámetros
+
+(ninguno)
+
+### Respuesta
+
+```json
+{
+  "status": "indexed",
+  "indexed": 42,
+  "updated": 7,
+  "durationMs": 3800
+}
+```
+
+---
+
+## `reset_vault`
+
+Borra todas las notas curadas, el índice RAG y los manifests SHA256 del proyecto, y deja el vault vacío listo para reconstruirse desde cero.
+
+### Parámetros
+
+(ninguno)
+
+### Qué borra
+
+| Artefacto | Ruta |
+|---|---|
+| Notas del vault | `~/.codex-vaults/{proyecto}/` — todas las subcarpetas y archivos `.md` |
+| Índice RAG | `~/.codex-context/rag/{proyecto}.json` |
+| Manifests SHA256 | Todos los `.codex-manifest.json` bajo la raíz del proyecto |
+
+El vault se recrea vacío y el engine en memoria se resetea.
+
+### Respuesta
+
+```json
+{
+  "status": "reset",
+  "vaultPath": "/home/user/.codex-vaults/my-project",
+  "notesDeleted": 42,
+  "indexDeleted": true,
+  "manifestsDeleted": 3,
+  "message": "Vault reset. Run curate_path(\"/home/user/dev/my-project\") to rebuild from scratch."
+}
+```
+
+### Cuándo usar
+
+- El vault tiene notas desactualizadas y querés empezar de cero
+- Cambiaste de versión major del proyecto y las notas ya no son relevantes
+- El vault está corrupto (frontmatter inválido, índice inconsistente)
+- Cambiaste `CODEX_EMBED_MODEL` y el índice viejo es incompatible con el nuevo modelo

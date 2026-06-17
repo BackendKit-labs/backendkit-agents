@@ -395,6 +395,48 @@ Retorna:
 
 ---
 
+### `reset_vault`
+
+Borra todas las notas curadas, el índice RAG y los manifests SHA256 del proyecto actual, y deja el vault vacío listo para ser reconstruido desde cero.
+
+```
+Parámetros:
+  (ninguno)
+
+Retorna:
+  - status: "reset"
+  - vaultPath: ruta al vault borrado y recreado vacío
+  - notesDeleted: cantidad de notas .md eliminadas
+  - indexDeleted: true si el archivo de índice RAG fue eliminado
+  - manifestsDeleted: cantidad de archivos .codex-manifest.json eliminados
+  - message: sugerencia del próximo curate_path a ejecutar
+```
+
+**Qué borra exactamente:**
+
+| Artefacto | Ruta |
+|---|---|
+| Notas del vault | `~/.codex-vaults/{proyecto}/` (todas las subcarpetas y `.md`) |
+| Índice RAG | `~/.codex-context/rag/{proyecto}.json` |
+| Manifests SHA256 | Todos los `.codex-manifest.json` bajo la raíz del proyecto |
+
+El vault se recrea vacío automáticamente. El estado en memoria del engine también se resetea.
+
+**Cuándo usarlo:**
+- El vault tiene notas desactualizadas o incorrectas y querés empezar de cero
+- Cambiaste de versión del proyecto o de rama major y las notas ya no son relevantes
+- El vault está corrupto (notas con frontmatter inválido, índice inconsistente)
+- Cambiaste `CODEX_EMBED_MODEL` y el índice viejo es incompatible
+
+**Ejemplo:**
+
+```
+Vault corrupto o desactualizado → reset_vault()
+Luego reconstruir           → curate_path("/ruta/al/proyecto/src")
+```
+
+---
+
 ## Flujo típico de uso
 
 ```
@@ -426,6 +468,10 @@ Retorna:
 
 7. Forzar reindexado completo (si es necesario)
    → reindex_vault() — espera hasta que el índice esté listo
+
+8. Resetear el vault (si está corrupto o desactualizado)
+   → reset_vault() — borra todo y deja el vault vacío
+   → curate_path("/ruta/al/proyecto/src") — reconstruir desde cero
 ```
 
 ---
