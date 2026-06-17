@@ -35,6 +35,7 @@ export class TransformersEmbedder {
             const pipeline = await getPipeline();
             this.extractor = await pipeline('feature-extraction', this.model, {
                 progress_callback: onProgress,
+                quantized: true,
             });
         }
         return this.extractor;
