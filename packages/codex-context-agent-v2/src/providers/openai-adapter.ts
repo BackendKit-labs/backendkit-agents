@@ -1,5 +1,5 @@
 import OpenAI from 'openai';
-import type { CuratorLLMProvider } from './types.js';
+import type { CuratorLLMProvider, CompleteOptions } from './types.js';
 
 export interface OpenAIAdapterOptions {
     apiKey: string;
@@ -24,17 +24,18 @@ export class OpenAIAdapter implements CuratorLLMProvider {
         this.isReasoner = /reasoner|^o\d/.test(opts.model);
     }
 
-    async complete(systemPrompt: string, userMessage: string): Promise<string> {
+    async complete(systemPrompt: string, userMessage: string, opts: CompleteOptions = {}): Promise<string> {
+        const json = opts.json !== false;
         const completion = await this.client.chat.completions.create({
             model:           this.model,
             max_tokens:      this.maxTokens,
-            response_format: { type: 'json_object' },
+            ...(json ? { response_format: { type: 'json_object' as const } } : {}),
             ...(this.isReasoner ? {} : { temperature: 0.2 }),
             messages: [
                 { role: 'system', content: systemPrompt },
                 { role: 'user',   content: userMessage },
             ],
         });
-        return completion.choices[0]?.message?.content ?? '{}';
+        return completion.choices[0]?.message?.content ?? (json ? '{}' : '');
     }
 }

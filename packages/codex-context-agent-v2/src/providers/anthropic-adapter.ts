@@ -1,5 +1,5 @@
 import Anthropic from '@anthropic-ai/sdk';
-import type { CuratorLLMProvider } from './types.js';
+import type { CuratorLLMProvider, CompleteOptions } from './types.js';
 
 export interface AnthropicAdapterOptions {
     apiKey: string;
@@ -18,7 +18,8 @@ export class AnthropicAdapter implements CuratorLLMProvider {
         this.maxTokens = opts.maxTokens ?? 16384;
     }
 
-    async complete(systemPrompt: string, userMessage: string): Promise<string> {
+    async complete(systemPrompt: string, userMessage: string, opts: CompleteOptions = {}): Promise<string> {
+        const json = opts.json !== false;
         const response = await this.client.messages.create({
             model:      this.model,
             max_tokens: this.maxTokens,
@@ -26,6 +27,6 @@ export class AnthropicAdapter implements CuratorLLMProvider {
             messages:   [{ role: 'user', content: userMessage }],
         });
         const block = response.content[0];
-        return block?.type === 'text' ? block.text : '{}';
+        return block?.type === 'text' ? block.text : (json ? '{}' : '');
     }
 }

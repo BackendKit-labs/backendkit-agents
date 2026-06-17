@@ -51,8 +51,15 @@ export class KnowledgeSynthesizer {
         try {
             const synthesizedContent = await this.provider.complete(
                 'You are a knowledge synthesis expert. Generate high-quality markdown notes.',
-                prompt
+                prompt,
+                { json: false }
             );
+
+            // Guard against empty/whitespace responses — don't save a blank synthesis note.
+            if (!synthesizedContent || synthesizedContent.trim().length === 0) {
+                console.error('Synthesis returned empty content — skipping note.');
+                return null;
+            }
 
             return {
                 title: `${query} — Synthesis`,
